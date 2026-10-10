@@ -2,6 +2,7 @@ package dev.aigw.app.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -108,12 +109,22 @@ fun CustomProviderScreen(
             )
 
             SectionLabel("自定义请求头（可选）")
+            // 逐行实时校验：解析失败的行显式标红，绝不静默丢弃
+            val headerErrors = remember(headersText) { headerLineErrors(headersText) }
             OutlinedTextField(
                 value = headersText,
                 onValueChange = { headersText = it },
-                label = { Text("一行一条，格式：名称: 值") },
+                label = { Text("一行一条，格式：名称: 值（冒号分隔）") },
                 supportingText = {
-                    Text("值支持 {key} 占位符（替换为当前账号的 API Key）；与默认头同名时覆盖默认值")
+                    Column {
+                        Text("值支持 {key} 占位符（替换为当前账号的 API Key）；与默认头同名时覆盖默认值")
+                        if (headerErrors.isNotEmpty()) {
+                            Text(
+                                text = "⚠ 无效行：${headerErrors.joinToString("；")}",
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
                 },
                 minLines = 2,
                 modifier = Modifier.fillMaxWidth(),
@@ -171,15 +182,28 @@ fun CustomProviderScreen(
 
 /** 「名称: 值」逐行解析请求头；无冒号或名称为空的行跳过。 */
 private fun parseHeaders(text: String): Map<String, String> =
-    text.lines().mapNotNull { line ->
-        val trimmed = line.trim()
-        if (trimmed.isEmpty()) return@mapNotNull null
-        val idx = trimmed.indexOf(':')
-        if (idx <= 0) return@mapNotNull null
-        val headerName = trimmed.take(idx).trim()
-        val value = trimmed.substring(idx + 1).trim()
-        if (headerName.isEmpty()) null else headerName to value
-    }.toMap()
+    headerLineErrors(text)
+        .filterIsInstance<HeaderLine>()
+        .associate { it.name to it.value }
+
+/** 校验每一行：合法的返回 [HeaderLine]，非法的返回错误说明。 */
+private fun headerLineErrors(text: String): List<Any> =
+    text.lines().mapIndexed { index, raw ->
+        val line = raw.trim()
+        when {
+            line.isEmpty() -> null
+            // 常见误用：只粘了 User-Agent 的值（客户端指纹串），没有头名称
+            line.contains('/') && !line.contains(':') && line.first().isLetterOrDigit() ->
+                "第 ${index + 1} 行像是一个值而不是「名称: 值」——如果你要伪装客户端，应该写 User-Agent: $line"
+            !line.contains(':') -> "第 ${index + 1} 行缺少冒号"
+            else -> {
+                val name = line.take(line.indexOf(':')).trim()
+                if (name.isEmpty()) "第 ${index + 1} 行冒号前没有头名称" else HeaderLine(name, line.substring(line.indexOf(':') + 1).trim())
+            }
+        }
+    }.filterNotNull()
+
+private data class HeaderLine(val name: String, val value: String)
 
 /** 请求头回显成「名称: 值」多行文本。 */
 private fun headersToText(headers: Map<String, String>): String =

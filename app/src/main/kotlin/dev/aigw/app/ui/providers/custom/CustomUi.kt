@@ -106,7 +106,9 @@ class CustomUi(override val id: String) : ProviderUi {
                 maxLines = 6,
                 modifier = Modifier.fillMaxWidth(),
             )
-            ModelsSection(accounts, actions, apiKey.trim(), models, onFetched = { fetchedModels = it }) { models = it }
+            // 拉模型只用第一行 Key：整段多行文本当密钥发出去必被拒
+            val firstKey = apiKey.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
+            ModelsSection(accounts, actions, firstKey, models, onFetched = { fetchedModels = it }) { models = it }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -114,15 +116,22 @@ class CustomUi(override val id: String) : ProviderUi {
                 Button(
                     onClick = {
                         val keys = apiKey.lines().map { it.trim() }.filter { it.isNotEmpty() }
-                        actions.onAddCustomAccount(
-                            id,
-                            nickname,
-                            keys.firstOrNull().orEmpty(),
-                            models.lines().map { it.trim() }.filter { it.isNotEmpty() },
-                        )
-                        // 多个 Key 时走批量导入（复用引擎的账号池增量同步）
-                        if (keys.size > 1) {
-                            actions.onAddCustomKeys(id, keys.drop(1))
+                        // 单个 Key 且填了名称 → 走单账号通道（保留昵称）；
+                        // 其余（多行、或没填名称）走批量通道：容错、自动去重、不会因重复 Key 中断
+                        if (keys.size == 1 && nickname.isNotBlank()) {
+                            actions.onAddCustomAccount(
+                                id,
+                                nickname,
+                                keys.first(),
+                                models.lines().map { it.trim() }.filter { it.isNotEmpty() },
+                            )
+                        } else {
+                            // 批量通道：Key 去重合并进账号池，模型列表一并保存
+                            actions.onAddCustomKeys(
+                                id,
+                                keys,
+                                models.lines().map { it.trim() }.filter { it.isNotEmpty() },
+                            )
                         }
                         nickname = ""
                         apiKey = ""
@@ -130,7 +139,10 @@ class CustomUi(override val id: String) : ProviderUi {
                     },
                     enabled = apiKey.isNotBlank(),
                     modifier = Modifier.weight(1f),
-                ) { Text(if (apiKey.lines().count { it.trim().isNotEmpty() } > 1) "批量添加账号" else "添加账号") }
+                ) {
+                    val count = apiKey.lines().count { it.trim().isNotEmpty() }
+                    Text(if (count > 1) "批量添加（$count 个）" else "添加账号")
+                }
                 OutlinedButton(
                     onClick = { expanded = false },
                     modifier = Modifier.weight(1f),

@@ -59,8 +59,9 @@ class ProviderUiActions(
     /** 添加自定义供应商账号（名称可选，默认同供应商名）；连同模型列表一并保存。 */
     val onAddCustomAccount: (providerId: String, nickname: String, apiKey: String, models: List<String>) -> Unit =
         { _, _, _, _ -> },
-    /** 批量导入自定义供应商的 API Key（UI 已按行拆分去重）。 */
-    val onAddCustomKeys: (providerId: String, keys: List<String>) -> Unit = { _, _ -> },
+    /** 批量导入自定义供应商的 API Key（UI 已按行拆分）；连同模型列表一并保存。 */
+    val onAddCustomKeys: (providerId: String, keys: List<String>, models: List<String>) -> Unit =
+        { _, _, _ -> },
     /** 改账号显示名称（自定义供应商用）。 */
     val onRenameAccount: (providerId: String, uid: String, nickname: String) -> Unit = { _, _, _ -> },
     /** 读账号的 API Key（仅自定义供应商）。 */

@@ -736,14 +736,14 @@ class AppViewModel(
             _state.value = _state.value.copy(busy = "正在拉取模型")
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    CustomProvider.fetchModels(baseUrl, apiKey, customHeadersForFetch(providerId))
+                    CustomProvider.fetchModelsResult(baseUrl, apiKey, customHeadersForFetch(providerId))
                 }
             }
             _state.value = _state.value.copy(busy = "")
             result.fold(
-                onSuccess = { models ->
-                    if (models.isEmpty()) {
-                        onResult(emptyList(), "没有拉到模型，检查接口地址与 API Key")
+                onSuccess = { (models, error) ->
+                    if (error.isNotEmpty() || models.isEmpty()) {
+                        onResult(emptyList(), error.ifEmpty { "没有拉到模型，检查接口地址与 API Key" })
                     } else {
                         onResult(models, "")
                     }
@@ -829,10 +829,11 @@ class AppViewModel(
         if (key.isEmpty()) throw IllegalStateException("API Key 不能为空")
         val provider = engine.registry.get(providerId) as? CustomProvider
             ?: throw IllegalStateException("供应商不存在")
+        // 模型列表先保存：即使 Key 重复报错，用户选的模型也不丢
+        saveCustomModels(providerId, models)
         val uid = CustomProvider.uidOf(key)
         if (engine.account(providerId, uid) != null) throw IllegalStateException("这个 API Key 已经添加过了")
         engine.addAccount(providerId, uid, nickname.trim().ifEmpty { provider.displayName }, CustomProvider.secretOf(key))
-        saveCustomModels(providerId, models)
         "账号已添加"
     }
 
@@ -887,12 +888,17 @@ class AppViewModel(
     }
 
     /**
-     * 批量导入 API Key（一行一个），并入供应商配置后同步到账号池。
+     * 批量导入 API Key（一行一个），并入供应商配置后同步到账号池；可同时更新模型列表。
      *
      * 与单账号添加不同：这里一次可能进来几十个 key，全部交给 [GatewayEngine.syncCustomAccounts]
      * 做增量同步——已存在的跳过，新的建号，名称沿用供应商名（之后可在详情页单独改名）。
      */
-    fun addCustomKeys(providerId: String, keys: List<String>, headers: Map<String, String> = emptyMap()) = action {
+    fun addCustomKeys(
+        providerId: String,
+        keys: List<String>,
+        models: List<String> = emptyList(),
+        headers: Map<String, String> = emptyMap(),
+    ) = action {
         if (keys.isEmpty()) throw IllegalStateException("没有可导入的 API Key")
         val repository = engine.settingsRepository
         val existing = repository.loadCustomProviders()
@@ -901,6 +907,7 @@ class AppViewModel(
         val fresh = keys.map { it.trim() }.filter { it.isNotEmpty() }
         val updated = config.copy(
             apiKeys = (config.apiKeys + fresh).distinct(),
+            models = if (models.isNotEmpty()) models else config.models,
             headers = if (headers.isNotEmpty()) headers else config.headers,
         )
         repository.saveCustomProviders(existing.map { if (it.providerId == providerId) updated else it })
@@ -908,6 +915,19 @@ class AppViewModel(
         engine.syncCustomAccounts(updated)
         val added = updated.apiKeys.size - config.apiKeys.size
         "导入完成：新增 ${added} 个，跳过重复 ${fresh.size - added} 个"
+    }
+
+    /** 保存自定义供应商的请求头（详情页改头即时生效：重建 provider 实例）。 */
+    fun saveCustomProviderHeaders(providerId: String, headers: Map<String, String>) = action {
+        val repository = engine.settingsRepository
+        val existing = repository.loadCustomProviders()
+        val config = existing.firstOrNull { it.providerId == providerId }
+            ?: throw IllegalStateException("供应商不存在")
+        repository.saveCustomProviders(existing.map {
+            if (it.providerId == providerId) it.copy(headers = headers) else it
+        })
+        engine.reloadCustomProviders()
+        "请求头已保存"
     }
 
     private fun noticeOf(outcome: LoginOutcome): String =

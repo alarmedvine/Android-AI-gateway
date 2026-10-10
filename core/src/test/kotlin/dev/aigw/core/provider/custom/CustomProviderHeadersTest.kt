@@ -127,11 +127,12 @@ class CustomProviderHeadersTest {
                 }.toString()
             },
         ) { baseUrl, last ->
-            val models = CustomProvider.fetchModels(
+            val (models, error) = CustomProvider.fetchModelsResult(
                 baseUrl,
                 "sk-abc",
                 mapOf("new-api-user" to "sk-abc"),
             )
+            assertEquals("", error)
             assertEquals(listOf("m1"), models)
             assertEquals(listOf("sk-abc"), last().headers["new-api-user"])
             assertEquals("GET", last().method)

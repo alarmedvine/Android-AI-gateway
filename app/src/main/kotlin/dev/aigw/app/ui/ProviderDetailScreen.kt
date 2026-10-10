@@ -52,7 +52,7 @@ fun ProviderDetailScreen(
         },
         onImport = { id, raw -> viewModel.importCredentials(id, raw) },
         onAddCustomAccount = { id, nickname, apiKey, models -> viewModel.addCustomAccount(id, nickname, apiKey, models) },
-        onAddCustomKeys = { id, keys -> viewModel.addCustomKeys(id, keys) },
+        onAddCustomKeys = { id, keys, models -> viewModel.addCustomKeys(id, keys, models) },
         onRenameAccount = { id, uid, nickname -> viewModel.renameAccount(id, uid, nickname) },
         accountApiKeyOf = { id, uid -> viewModel.accountApiKey(id, uid) },
         customModelsOf = { id -> viewModel.customModels(id) },

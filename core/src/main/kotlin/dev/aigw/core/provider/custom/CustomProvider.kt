@@ -257,39 +257,54 @@ class CustomProvider(
          *
          * 不依赖已保存的配置：新建供应商时用户还没保存，也要能先拉一次看看有哪些模型。
          */
-        fun fetchModels(baseUrl: String, apiKey: String): List<String> {
-            if (baseUrl.isBlank()) return emptyList()
-            return fetchModels(baseUrl, apiKey, emptyMap())
-        }
+        fun fetchModels(baseUrl: String, apiKey: String): List<String> = fetchModelsResult(baseUrl, apiKey, emptyMap()).first
 
         /**
-         * 带自定义请求头拉模型列表。
+         * 带自定义请求头拉模型列表，并返回（模型, 错误说明）。
          *
-         * 不依赖已保存的配置：新建供应商时用户还没保存，也要能先拉一次看看有哪些模型。
-         * 站点对请求头有强校验时，不带头连 `/v1/models` 都会被拒。
+         * 错误说明带 HTTP 状态与响应片段——站点对请求头/密钥的拒绝原因通常写在响应体里，
+         * 直接透出给用户，不能吞成「没拉到模型」。
          */
-        fun fetchModels(baseUrl: String, apiKey: String, headers: Map<String, String>): List<String> {
-            if (baseUrl.isBlank()) return emptyList()
+        fun fetchModelsResult(baseUrl: String, apiKey: String, headers: Map<String, String>): Pair<List<String>, String> {
+            if (baseUrl.isBlank()) return emptyList<String>() to "接口地址为空"
             val conn = try {
                 openConnection(modelsUrl(baseUrl), apiKey, null, "GET", headers)
-            } catch (_: Exception) {
-                return emptyList()
+            } catch (e: Exception) {
+                return emptyList<String>() to "连接失败：${e.message ?: e.javaClass.simpleName}"
             }
             return try {
-                if (conn.responseCode !in 200..299) return emptyList()
+                val status = conn.responseCode
+                if (status !in 200..299) {
+                    val body = runCatching { readLimited(conn.errorStream) }.getOrDefault("")
+                    val hint = if (status == 404) "（模型端点 404：确认接口地址是否要到 /v1）" else ""
+                    emptyList<String>() to "HTTP $status$hint${extractBrief(body)}"
+                }
                 val text = readLimited(conn.inputStream)
                 val obj = runCatching { JsonParser.parseString(text).asJsonObject }.getOrNull()
-                    ?: return emptyList()
-                val data = obj.arrayOrNull("data") ?: return emptyList()
-                data.mapNotNull { element ->
+                    ?: return emptyList<String>() to "响应不是 JSON：${text.trim().take(120)}"
+                val data = obj.arrayOrNull("data")
+                    ?: return emptyList<String>() to "响应里没有 data 字段：${text.trim().take(120)}"
+                val models = data.mapNotNull { element ->
                     val item = runCatching { element.asJsonObject }.getOrNull() ?: return@mapNotNull null
                     item.get("id")?.asString?.takeIf { it.isNotEmpty() }
                 }
-            } catch (_: Exception) {
-                emptyList()
+                if (models.isEmpty()) emptyList<String>() to "上游返回了空模型列表" else models to ""
+            } catch (e: Exception) {
+                emptyList<String>() to "读取失败：${e.message ?: e.javaClass.simpleName}"
             } finally {
                 conn.disconnect()
             }
+        }
+
+        /** 把上游错误响应压成一行简短说明（优先取 JSON 里的 message 字段）。 */
+        private fun extractBrief(body: String): String {
+            if (body.isBlank()) return ""
+            val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull()
+            if (obj != null) {
+                obj.objOrNull("error")?.get("message")?.asString?.takeIf { it.isNotEmpty() }?.let { return "：$it" }
+                obj.get("message")?.asString?.takeIf { it.isNotEmpty() }?.let { return "：$it" }
+            }
+            return "：${body.trim().replace('\n', ' ').take(160)}"
         }
 
         private fun openConnection(
