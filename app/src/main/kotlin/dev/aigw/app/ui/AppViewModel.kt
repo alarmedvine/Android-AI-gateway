@@ -2,6 +2,7 @@ package dev.aigw.app.ui
 
 import android.app.Application
 import android.content.ComponentName
+import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -10,8 +11,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import dev.aigw.core.util.arrayOrNull
+import dev.aigw.core.util.asObjectOrNull
+import dev.aigw.core.util.boolOrNull
+import dev.aigw.core.util.stringOrNull
 import dev.aigw.app.data.KeepAlive
 import dev.aigw.app.data.KeepAliveStatus
 import dev.aigw.app.gatewayEngine
@@ -719,12 +725,19 @@ class AppViewModel(
         }
     }
 
-    /** 用当前填写的地址与 Key 拉取模型列表（新建供应商时还没保存也能用）。 */
-    fun fetchCustomModels(baseUrl: String, apiKey: String, onResult: (List<String>, String) -> Unit) {
+    /** 用任意 key 从云端拉取模型列表（新建供应商时还没保存也能用；带供应商已保存的请求头）。 */
+    fun fetchCustomModels(
+        providerId: String,
+        baseUrl: String,
+        apiKey: String,
+        onResult: (List<String>, String) -> Unit,
+    ) {
         viewModelScope.launch {
             _state.value = _state.value.copy(busy = "正在拉取模型")
             val result = withContext(Dispatchers.IO) {
-                runCatching { CustomProvider.fetchModels(baseUrl, apiKey) }
+                runCatching {
+                    CustomProvider.fetchModels(baseUrl, apiKey, customHeadersForFetch(providerId))
+                }
             }
             _state.value = _state.value.copy(busy = "")
             result.fold(
@@ -860,6 +873,41 @@ class AppViewModel(
     fun customBaseUrl(providerId: String): String {
         val provider = engine.registry.get(providerId) as? CustomProvider ?: return ""
         return provider.baseUrl
+    }
+
+    /** 拉模型时带上该供应商已保存的自定义请求头（严格站点不带会拒绝）。 */
+    private fun customHeadersForFetch(providerId: String): Map<String, String> =
+        engine.settingsRepository.loadCustomProviders()
+            .firstOrNull { it.providerId == providerId }?.headers.orEmpty()
+
+    /** 读自定义供应商已保存的额外请求头（编辑页回显用）。 */
+    fun customHeaders(providerId: String): Map<String, String> {
+        val repository = engine.settingsRepository
+        return repository.loadCustomProviders().firstOrNull { it.providerId == providerId }?.headers.orEmpty()
+    }
+
+    /**
+     * 批量导入 API Key（一行一个），并入供应商配置后同步到账号池。
+     *
+     * 与单账号添加不同：这里一次可能进来几十个 key，全部交给 [GatewayEngine.syncCustomAccounts]
+     * 做增量同步——已存在的跳过，新的建号，名称沿用供应商名（之后可在详情页单独改名）。
+     */
+    fun addCustomKeys(providerId: String, keys: List<String>, headers: Map<String, String> = emptyMap()) = action {
+        if (keys.isEmpty()) throw IllegalStateException("没有可导入的 API Key")
+        val repository = engine.settingsRepository
+        val existing = repository.loadCustomProviders()
+        val config = existing.firstOrNull { it.providerId == providerId }
+            ?: throw IllegalStateException("供应商不存在")
+        val fresh = keys.map { it.trim() }.filter { it.isNotEmpty() }
+        val updated = config.copy(
+            apiKeys = (config.apiKeys + fresh).distinct(),
+            headers = if (headers.isNotEmpty()) headers else config.headers,
+        )
+        repository.saveCustomProviders(existing.map { if (it.providerId == providerId) updated else it })
+        engine.reloadCustomProviders()
+        engine.syncCustomAccounts(updated)
+        val added = updated.apiKeys.size - config.apiKeys.size
+        "导入完成：新增 ${added} 个，跳过重复 ${fresh.size - added} 个"
     }
 
     private fun noticeOf(outcome: LoginOutcome): String =
@@ -1039,6 +1087,102 @@ class AppViewModel(
         engine.reloadCustomProviders()
         "供应商已删除"
     }
+
+    /**
+     * 导出全部供应商配置与账号（含 API Key）为一个 JSON 文档，写到 SAF 所选文件。
+     *
+     * 供「换手机 / 重装 / 覆盖安装后配置还在」场景使用：明文 JSON，交给用户自行保管，
+     * 导入端见 [importKeysBackup]。
+     */
+    fun exportKeysBackup(uri: Uri) = action {
+        writeKeysBackup(uri)
+        "备份已导出"
+    }
+
+    /**
+     * 导入备份文件：自定义供应商整体恢复（存在则合并覆盖），
+     * 其它供应商账号按 uid 去重后并入账号池。
+     */
+    fun importKeysBackup(uri: Uri) = action {
+        readKeysBackup(uri)
+    }
+
+    private fun writeKeysBackup(uri: Uri) {
+        val repository = engine.settingsRepository
+        val doc = JsonObject().apply {
+            addProperty("version", 1)
+            addProperty("exportedAt", java.time.Instant.now().toString())
+            add(
+                "providers",
+                JsonArray().apply {
+                    repository.loadCustomProviders().forEach { add(it.toJson()) }
+                },
+            )
+            add(
+                "accounts",
+                JsonArray().apply {
+                    for (provider in engine.registry.all()) {
+                        for (status in engine.accounts(provider.id)) {
+                            val account = engine.account(provider.id, status.uid) ?: continue
+                            add(
+                                JsonObject().apply {
+                                    addProperty("providerId", account.providerId)
+                                    addProperty("uid", account.uid)
+                                    addProperty("nickname", account.nickname)
+                                    addProperty("secret", account.secret)
+                                    addProperty("enabled", status.enabled && !status.disabled)
+                                },
+                            )
+                        }
+                    }
+                },
+            )
+        }
+        val payload = doc.toString()
+        resolverOf().openOutputStream(uri)?.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+            ?: throw IllegalStateException("无法写入所选文件")
+    }
+
+    private fun readKeysBackup(uri: Uri): String {
+        val payload = resolverOf().openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+            ?: throw IllegalStateException("无法读取所选文件")
+        val root = runCatching { JsonParser.parseString(payload).asJsonObject }
+            .getOrNull() ?: throw IllegalStateException("文件不是合法的 JSON 备份")
+        val repository = engine.settingsRepository
+
+        val providers = root.arrayOrNull("providers")
+        val customList = repository.loadCustomProviders().toMutableList()
+        var customCount = 0
+        for (element in providers ?: JsonArray()) {
+            val obj = element.asObjectOrNull() ?: continue
+            val config = CustomProviderConfig.fromJson(obj) ?: continue
+            customList.removeAll { it.key == config.key }
+            customList.add(config)
+            customCount++
+        }
+        if (customList.isNotEmpty()) repository.saveCustomProviders(customList)
+
+        var accountCount = 0
+        for (element in root.arrayOrNull("accounts") ?: JsonArray()) {
+            val obj = element.asObjectOrNull() ?: continue
+            val providerId = obj.stringOrNull("providerId").orEmpty()
+            val uid = obj.stringOrNull("uid").orEmpty()
+            val secret = obj.stringOrNull("secret").orEmpty()
+            if (providerId.isEmpty() || uid.isEmpty() || secret.isEmpty()) continue
+            if (engine.registry.get(providerId) == null) continue
+            if (engine.account(providerId, uid) != null) continue
+            engine.addAccount(providerId, uid, obj.stringOrNull("nickname").orEmpty(), secret)
+            if (obj.boolOrNull("enabled") == false) engine.setAccountEnabled(providerId, uid, false)
+            accountCount++
+        }
+        engine.reloadCustomProviders()
+        // 恢复的自定义供应商要把 key 同步进账号池
+        for (config in repository.loadCustomProviders()) engine.syncCustomAccounts(config)
+        return "导入完成：供应商 ${customCount} 个，账号 ${accountCount} 个"
+    }
+
+    /** 每次调用时解析当前的 ContentResolver（ViewModel 持有 Application 上下文）。 */
+    private fun resolverOf(): ContentResolver = app.contentResolver
 
     // ------------------------------------------------------------------ 代理
 

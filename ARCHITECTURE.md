@@ -47,7 +47,7 @@
 │  codebuddy:   腾讯 OpenAI 兼容（强制 stream）       │
 │  antigravity: Gemini 风格 → OpenAI（双向翻译）      │
 │  loomy:       近乎直通（HTTP 200 + 业务码陷阱）      │
-│  custom:*:    纯直通                              │
+│  custom:*:    直通或 Responses 翻译（含自定义请求头） │
 └───────────────┬─────────────────────────────────┘
                 ▼
         [ 上游 API ]
@@ -141,7 +141,7 @@ call/...                           # 调用日志
 | WorkBuddy | `codebuddy` | 设备授权（state 轮询） | 国内 `copilot.tencent.com` / 国际 `workbuddy.ai` | 上游拒绝非流式（必须 stream:true）；tool_choice 只认字符串；签到/成长中心仅国内版 |
 | Antigravity | `antigravity` | OAuth loopback 51121 | `cloudcode-pa.googleapis.com` | Gemini 风格：role 用 user/model；schema 不支持 const/$ref；contents 必须严格交替；tool 参数名是 parametersJsonSchema；response.result 必须是字符串 |
 | Loomy | `loomy` | 手机短信 | `xfinfr.com` | 鉴权失败是 **HTTP 200 + 业务码**，不是 4xx |
-| 自定义 | `custom:<key>` | API Key | 用户填的 baseUrl | 无 |
+| 自定义 | `custom:<key>` | API Key | 用户填的 baseUrl | `protocol=openai` 直通 `/chat/completions`；`protocol=responses` 走 `/responses`，由 `ResponseApiTranslator` 做 Chat⇄Responses 双向翻译（含 SSE）；`headers` 是随请求发送的自定义请求头（值支持 `{key}` 占位符=当前账号 API Key），可覆盖默认头 |
 
 ---
 

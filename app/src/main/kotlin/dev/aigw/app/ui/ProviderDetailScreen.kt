@@ -52,12 +52,13 @@ fun ProviderDetailScreen(
         },
         onImport = { id, raw -> viewModel.importCredentials(id, raw) },
         onAddCustomAccount = { id, nickname, apiKey, models -> viewModel.addCustomAccount(id, nickname, apiKey, models) },
+        onAddCustomKeys = { id, keys -> viewModel.addCustomKeys(id, keys) },
         onRenameAccount = { id, uid, nickname -> viewModel.renameAccount(id, uid, nickname) },
         accountApiKeyOf = { id, uid -> viewModel.accountApiKey(id, uid) },
         customModelsOf = { id -> viewModel.customModels(id) },
         customBaseUrlOf = { id -> viewModel.customBaseUrl(id) },
-        onFetchCustomModels = { baseUrl, apiKey, onResult ->
-            viewModel.fetchCustomModels(baseUrl, apiKey, onResult)
+        onFetchCustomModels = { providerId, baseUrl, apiKey, onResult ->
+            viewModel.fetchCustomModels(providerId, baseUrl, apiKey, onResult)
         },
         onRefreshCredits = { id, uid -> viewModel.refreshCredits(id, uid) },
         onAction = { id, uid, action, payload -> viewModel.performAction(id, uid, action, payload) },

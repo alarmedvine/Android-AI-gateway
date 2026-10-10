@@ -101,8 +101,9 @@ class CustomUi(override val id: String) : ProviderUi {
             OutlinedTextField(
                 value = apiKey,
                 onValueChange = { apiKey = it },
-                label = { Text("API Key") },
-                singleLine = true,
+                label = { Text("API Key（一行一个，可批量粘贴）") },
+                minLines = 1,
+                maxLines = 6,
                 modifier = Modifier.fillMaxWidth(),
             )
             ModelsSection(accounts, actions, apiKey.trim(), models, onFetched = { fetchedModels = it }) { models = it }
@@ -112,19 +113,24 @@ class CustomUi(override val id: String) : ProviderUi {
             ) {
                 Button(
                     onClick = {
+                        val keys = apiKey.lines().map { it.trim() }.filter { it.isNotEmpty() }
                         actions.onAddCustomAccount(
                             id,
                             nickname,
-                            apiKey,
+                            keys.firstOrNull().orEmpty(),
                             models.lines().map { it.trim() }.filter { it.isNotEmpty() },
                         )
+                        // 多个 Key 时走批量导入（复用引擎的账号池增量同步）
+                        if (keys.size > 1) {
+                            actions.onAddCustomKeys(id, keys.drop(1))
+                        }
                         nickname = ""
                         apiKey = ""
                         expanded = false
                     },
                     enabled = apiKey.isNotBlank(),
                     modifier = Modifier.weight(1f),
-                ) { Text("添加账号") }
+                ) { Text(if (apiKey.lines().count { it.trim().isNotEmpty() } > 1) "批量添加账号" else "添加账号") }
                 OutlinedButton(
                     onClick = { expanded = false },
                     modifier = Modifier.weight(1f),
@@ -177,7 +183,7 @@ class CustomUi(override val id: String) : ProviderUi {
                         return@clickable
                     }
                     loading = true
-                    actions.onFetchCustomModels(baseUrl, key) { fetched, error ->
+                    actions.onFetchCustomModels(id, baseUrl, key) { fetched, error ->
                         loading = false
                         if (error.isNotEmpty()) {
                             actions.onNotice(error)

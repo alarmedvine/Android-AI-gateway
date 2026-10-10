@@ -120,6 +120,11 @@ data class CustomProviderConfig(
     val protocol: String = PROTOCOL_OPENAI,
     /** 手填或从 `/v1/models` 拉取的模型名列表。 */
     val models: List<String> = emptyList(),
+    /**
+     * 随每个上游请求发送的额外请求头（部分公益站强制校验特定头才放行）。
+     * 值支持 `{key}` 占位符——多账号轮询时替换为当前账号的 API Key。
+     */
+    val headers: Map<String, String> = emptyMap(),
     val enabled: Boolean = true,
 ) {
     val providerId: String get() = "custom:$key"
@@ -131,11 +136,16 @@ data class CustomProviderConfig(
         add("apiKeys", JsonArray().apply { apiKeys.forEach { add(it) } })
         addProperty("protocol", protocol)
         add("models", JsonArray().apply { models.forEach { add(it) } })
+        val headerObj = JsonObject()
+        for ((name, value) in headers) headerObj.addProperty(name, value)
+        add("headers", headerObj)
         addProperty("enabled", enabled)
     }
 
     companion object {
         const val PROTOCOL_OPENAI = "openai"
+        /** 上游只提供 OpenAI Responses API（/v1/responses）时使用。 */
+        const val PROTOCOL_RESPONSES = "responses"
 
         fun fromJson(obj: JsonObject): CustomProviderConfig? {
             val key = obj.get("key")?.asString.orEmpty()
@@ -143,6 +153,10 @@ data class CustomProviderConfig(
             if (key.isEmpty() || baseUrl.isEmpty()) return null
             val keys = obj.arrayOrNull("apiKeys")?.mapNotNull { it.asString } ?: emptyList()
             val models = obj.arrayOrNull("models")?.mapNotNull { it.asString } ?: emptyList()
+            val headers = LinkedHashMap<String, String>()
+            obj.objOrNull("headers")?.entrySet()?.forEach { (name, value) ->
+                if (value.isJsonPrimitive) headers[name] = value.asString
+            }
             return CustomProviderConfig(
                 key = key,
                 name = obj.get("name")?.asString.orEmpty().ifEmpty { key },
@@ -150,6 +164,7 @@ data class CustomProviderConfig(
                 apiKeys = keys,
                 protocol = obj.get("protocol")?.asString.orEmpty().ifEmpty { PROTOCOL_OPENAI },
                 models = models,
+                headers = headers,
                 enabled = obj.get("enabled")?.asBoolean ?: true,
             )
         }

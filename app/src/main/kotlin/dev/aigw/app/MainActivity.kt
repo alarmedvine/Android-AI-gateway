@@ -212,9 +212,12 @@ private fun AppRoot(viewModel: AppViewModel, state: AppUiState) {
 
                                 is SubPage.CustomProviderEdit -> CustomProviderScreen(
                     existing = state.customProviders.firstOrNull { it.key == page.key },
-                    onSave = {
-                        viewModel.saveCustomProvider(it)
-                        subPage = SubPage.ProviderDetail(it.providerId)
+                    onSave = { config, newKeys ->
+                        viewModel.saveCustomProvider(config)
+                        if (newKeys.isNotEmpty()) {
+                            viewModel.addCustomKeys(config.providerId, newKeys)
+                        }
+                        subPage = SubPage.ProviderDetail(config.providerId)
                     },
                     onDelete = {
                         viewModel.removeCustomProvider(it)

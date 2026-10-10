@@ -1,5 +1,7 @@
 package dev.aigw.app.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -35,6 +37,14 @@ fun DataManagementScreen(state: AppUiState, viewModel: AppViewModel, onBack: () 
     val retention = state.settings.logRetentionDays
     val records = state.storage?.recordsChars ?: 0L
 
+    // 密钥备份：SAF 选中目标文件后导出 / 选中备份文件后导入（含 API Key，明文 JSON）
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri -> uri?.let { viewModel.exportKeysBackup(it) } }
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> uri?.let { viewModel.importKeysBackup(it) } }
+
     // 存储占用不挂在全局 refresh 里（要扫全量存储 + 遍历缓存目录，代价高），
     // 所以进入本页时才单独算一次；清理动作后也会由 refreshStorage 更新。
     LaunchedEffect(Unit) { viewModel.refreshStorage() }
@@ -45,6 +55,23 @@ fun DataManagementScreen(state: AppUiState, viewModel: AppViewModel, onBack: () 
         leading = { BackButton(onBack) },
     ) {
         SectionCard(enterIndex = 0) {
+            Text("密钥备份", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = "导出全部供应商配置与 API Key（明文 JSON），用于换机/重装/覆盖安装后恢复；请妥善保管备份文件。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlineActionButton("导出备份") {
+                    exportLauncher.launch("aigw-keys-backup.json")
+                }
+                OutlineActionButton("导入备份") {
+                    importLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                }
+            }
+        }
+
+        SectionCard(enterIndex = 1) {
             Text("使用记录", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text(
                 text = "记录会保存每次请求的输入/输出/思考链，是应用数据体积的主要来源；服务运行时按保留天数每日自动清理。",

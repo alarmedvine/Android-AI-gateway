@@ -9,6 +9,7 @@ import dev.aigw.core.provider.ChatCall
 import dev.aigw.core.provider.CreditInfo
 import dev.aigw.core.provider.ErrorKind
 import dev.aigw.core.provider.FailedChatCall
+import dev.aigw.core.provider.LineTransformStream
 import dev.aigw.core.provider.OpenAiSseAggregator
 import dev.aigw.core.provider.Provider
 import dev.aigw.core.provider.ProviderAccount
@@ -30,6 +31,14 @@ import java.net.URL
  *
  * 无登录流程，凭证就是 API Key；配多个 key 时每个 key 是账号池里的一个「账号」，
  * 由账号池做轮询。模型列表以用户手填为准，也可用 [fetchModels] 从 `/v1/models` 拉取。
+ *
+ * 支持 `protocol` 两种上游协议：
+ * - `openai`（默认）：标准 `/chat/completions`；
+ * - `responses`：上游只提供 OpenAI Responses API（`/responses`），
+ *   由 [ResponseApiTranslator] 在本 provider 内部完成双向翻译。
+ *
+ * `headers` 是随每个上游请求发送的额外请求头（部分站点强制校验特定头才放行），
+ * 值支持 `{key}` 占位符（替换为当前账号的 API Key），多账号轮询时各自带各自的密钥。
  */
 class CustomProvider(
     private val config: CustomProviderConfig,
@@ -66,9 +75,17 @@ class CustomProvider(
         val key = parseKey(account) ?: return FailedChatCall(401, "凭证无法解析")
         val streaming = isStreaming(openAiBody)
         val model = requestedModel(openAiBody)
+        val responses = config.protocol == CustomProviderConfig.PROTOCOL_RESPONSES
+
+        val upstreamBody = if (responses) {
+            ResponseApiTranslator.chatToResponses(openAiBody).toString()
+        } else {
+            openAiBody
+        }
+        val url = if (responses) responsesUrl(config.baseUrl) else chatUrl(config.baseUrl)
 
         val conn = try {
-            openConnection(chatUrl(config.baseUrl), key, openAiBody, "POST")
+            openConnection(url, key, upstreamBody, "POST", config.headers)
         } catch (e: Exception) {
             return FailedChatCall(0, e.message ?: "连接失败")
         }
@@ -87,6 +104,16 @@ class CustomProvider(
         val contentType = conn.contentType.orEmpty()
         val stream = conn.inputStream
         if (contentType.contains("event-stream", ignoreCase = true)) {
+            if (responses) {
+                // Responses SSE → chat.completion.chunk SSE，逐行实时翻译
+                val translator = ResponseApiTranslator.SseTranslator(model)
+                val translated = LineTransformStream(
+                    stream,
+                    transform = { line -> translator.transform(line) },
+                    onFinish = { translator.finish() },
+                )
+                return StreamingChatCall(status, translated) { conn.disconnect() }
+            }
             if (streaming) {
                 return StreamingChatCall(status, stream) { conn.disconnect() }
             }
@@ -105,15 +132,26 @@ class CustomProvider(
         conn.disconnect()
         // 200 但空 body（代理吞响应、上游静默拒绝）：当成功会让客户端「输出完成却什么都没有」
         if (text.isBlank()) return emptyUpstreamFailure(status, contentType, text)
+        if (responses) {
+            // Responses JSON → chat.completion；客户端要流式时包成 chat chunk SSE
+            if (!text.trimStart().startsWith("{")) {
+                return protocolMismatchFailure(status, contentType, text)
+            }
+            val completion = ResponseApiTranslator.responsesToChat(text, model)
+            if (OpenAiSseAggregator.isEmptyCompletion(completion)) {
+                return emptyUpstreamFailure(status, contentType, text)
+            }
+            if (streaming) {
+                return StreamingChatCall(
+                    status,
+                    ResponseApiTranslator.completionAsChatSse(text, model).byteInputStream(Charsets.UTF_8),
+                )
+            }
+            return AggregatedChatCall(status, completion)
+        }
         // 非流式响应必须是 OpenAI completion；HTML 登录页之类不能当回复透传
         if (!isChatCompletion(text)) {
-            return StreamFailureChatCall(
-                status,
-                UpstreamError(
-                    ErrorKind.CLIENT,
-                    "上游响应不符合 OpenAI 协议（HTTP $status，Content-Type: ${contentType.ifEmpty { "—" }}）：${text.trim().take(200)}",
-                ),
-            )
+            return protocolMismatchFailure(status, contentType, text)
         }
         // 客户端要流式但上游只回了普通 JSON：包成 SSE，严格客户端才能解析出内容
         if (streaming) {
@@ -121,6 +159,15 @@ class CustomProvider(
         }
         return AggregatedChatCall(status, text)
     }
+
+    /** 上游响应不符合预期协议时的可检测失败。 */
+    private fun protocolMismatchFailure(status: Int, contentType: String, raw: String): ChatCall = StreamFailureChatCall(
+        status,
+        UpstreamError(
+            ErrorKind.CLIENT,
+            "上游响应不符合 OpenAI 协议（HTTP $status，Content-Type: ${contentType.ifEmpty { "—" }}）：${raw.trim().take(200)}",
+        ),
+    )
 
     /** 上游 200 但没给出任何内容：保持可检测的失败，不能报成「成功的空回复」。 */
     private fun emptyUpstreamFailure(status: Int, contentType: String, raw: String): ChatCall = StreamFailureChatCall(
@@ -212,8 +259,19 @@ class CustomProvider(
          */
         fun fetchModels(baseUrl: String, apiKey: String): List<String> {
             if (baseUrl.isBlank()) return emptyList()
+            return fetchModels(baseUrl, apiKey, emptyMap())
+        }
+
+        /**
+         * 带自定义请求头拉模型列表。
+         *
+         * 不依赖已保存的配置：新建供应商时用户还没保存，也要能先拉一次看看有哪些模型。
+         * 站点对请求头有强校验时，不带头连 `/v1/models` 都会被拒。
+         */
+        fun fetchModels(baseUrl: String, apiKey: String, headers: Map<String, String>): List<String> {
+            if (baseUrl.isBlank()) return emptyList()
             val conn = try {
-                openConnection(modelsUrl(baseUrl), apiKey, null, "GET")
+                openConnection(modelsUrl(baseUrl), apiKey, null, "GET", headers)
             } catch (_: Exception) {
                 return emptyList()
             }
@@ -239,6 +297,7 @@ class CustomProvider(
             key: String,
             body: String?,
             method: String,
+            headers: Map<String, String> = emptyMap(),
         ): HttpURLConnection {
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
@@ -249,6 +308,11 @@ class CustomProvider(
                 setRequestProperty("Accept-Encoding", "identity")
                 setRequestProperty("Accept", "text/event-stream, application/json")
                 if (key.isNotEmpty()) setRequestProperty("Authorization", "Bearer $key")
+                // 站点强校验的额外头。放最后：同名时覆盖默认头，让用户能纠正 Content-Type 等
+                for ((name, value) in headers) {
+                    if (name.isBlank()) continue
+                    setRequestProperty(name.trim(), expandValue(value, key))
+                }
             }
             if (body != null) {
                 conn.doOutput = true
@@ -264,6 +328,21 @@ class CustomProvider(
             val base = baseUrl.trim().trimEnd('/')
             return if (base.endsWith("/chat/completions")) base else "$base/chat/completions"
         }
+
+        /** Responses 协议的上游地址：`/chat/completions` 结尾替换为 `/responses`，其余追加。 */
+        private fun responsesUrl(baseUrl: String): String {
+            val base = baseUrl.trim().trimEnd('/')
+            return when {
+                base.endsWith("/responses") -> base
+                base.endsWith("/chat/completions") -> base.removeSuffix("/chat/completions") + "/responses"
+                base.endsWith("/v1") -> "$base/responses"
+                else -> "$base/responses"
+            }
+        }
+
+        /** 展开头值里的 `{key}` 占位符——多账号轮询时每个账号带自己的密钥。 */
+        private fun expandValue(value: String, key: String): String =
+            if (value.contains("{key}")) value.replace("{key}", key) else value
 
         private fun modelsUrl(baseUrl: String): String {
             val base = baseUrl.trim().trimEnd('/')
