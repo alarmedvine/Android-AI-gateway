@@ -734,9 +734,18 @@ class AppViewModel(
     ) {
         viewModelScope.launch {
             _state.value = _state.value.copy(busy = "正在拉取模型")
+            // 拉模型走静态方法（此时供应商可能还没保存），日志直接写进「记录」页
+            val log = engine.requestLog
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    CustomProvider.fetchModelsResult(baseUrl, apiKey, customHeadersForFetch(providerId))
+                    CustomProvider.fetchModelsResult(
+                        baseUrl,
+                        apiKey,
+                        customHeadersForFetch(providerId),
+                        dev.aigw.core.provider.custom.ProviderWireLog(
+                            brief = { text -> log.info("[$providerId] $text") },
+                        ),
+                    )
                 }
             }
             _state.value = _state.value.copy(busy = "")

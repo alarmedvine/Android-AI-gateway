@@ -40,9 +40,20 @@ import java.net.URL
  * `headers` 是随每个上游请求发送的额外请求头（部分站点强制校验特定头才放行），
  * 值支持 `{key}` 占位符（替换为当前账号的 API Key），多账号轮询时各自带各自的密钥。
  */
+/**
+ * 自定义供应商的可观测钩子：把上游请求/响应的关键事实写进「记录」页日志。
+ * 简明日志始终写一行；请求/响应原文走 [verbose]（受「详细日志」开关控制，可为 null）。
+ */
+class ProviderWireLog(
+    val brief: (String) -> Unit,
+    val verbose: ((String, String) -> Unit)? = null,
+)
+
 class CustomProvider(
     private val config: CustomProviderConfig,
     private val nowMillis: () -> Long = System::currentTimeMillis,
+    /** 上游调用日志；null 时静默（测试/CLI 场景）。 */
+    private val wireLog: ProviderWireLog? = null,
 ) : Provider {
 
     override val id: String = config.providerId
@@ -84,24 +95,34 @@ class CustomProvider(
         }
         val url = if (responses) responsesUrl(config.baseUrl) else chatUrl(config.baseUrl)
 
+        // 请求前：URL、协议、流式、模型、生效请求头（值脱敏），一次请求一条简明日志
+        wireLog?.brief("自定义上游 → POST $url（协议=${if (responses) "Responses" else "Chat"}，stream=$streaming，model=${model.ifEmpty { "—" }}）")
+        wireLog?.verbose?.invoke("上游请求头", headerDigest(key))
+        wireLog?.verbose?.invoke("上游请求体", upstreamBody)
+
         val conn = try {
             openConnection(url, key, upstreamBody, "POST", config.headers)
         } catch (e: Exception) {
+            wireLog?.brief("自定义上游 ← 连接失败：POST $url：${e.message ?: e.javaClass.simpleName}")
             return FailedChatCall(0, e.message ?: "连接失败")
         }
         val status = try {
             conn.responseCode
         } catch (e: Exception) {
             conn.disconnect()
+            wireLog?.brief("自定义上游 ← 连接失败（等待响应阶段）：${e.message ?: e.javaClass.simpleName}")
             return FailedChatCall(0, e.message ?: "连接失败")
         }
         if (status !in 200..299) {
             val body = runCatching { readLimited(conn.errorStream) }.getOrDefault("")
             conn.disconnect()
+            wireLog?.brief("自定义上游 ← HTTP $status：${extractBrief(body)}")
+            wireLog?.verbose?.invoke("上游错误原文", body)
             return FailedChatCall(status, body)
         }
 
         val contentType = conn.contentType.orEmpty()
+        wireLog?.brief("自定义上游 ← HTTP $status（${contentType.ifEmpty { "Content-Type 缺省" }}）")
         val stream = conn.inputStream
         if (contentType.contains("event-stream", ignoreCase = true)) {
             if (responses) {
@@ -224,6 +245,17 @@ class CustomProvider(
 
     // ------------------------------------------------------------------ 内部
 
+    /** 头部摘要（日志用）：名称 + 值，密钥类值只留前后 4 位。 */
+    private fun headerDigest(key: String): String {
+        val sb = StringBuilder()
+        sb.append("Authorization: Bearer ").append(mask(key)).append('\n')
+        for ((name, value) in config.headers) {
+            val raw = expandValue(value, key)
+            sb.append(name.trim()).append(": ").append(mask(raw)).append('\n')
+        }
+        return sb.toString().trimEnd()
+    }
+
     private fun parseKey(account: ProviderAccount): String? {
         val obj = runCatching { JsonParser.parseString(account.secret).asJsonObject }.getOrNull()
         return obj?.get("apiKey")?.asString?.takeIf { it.isNotEmpty() }
@@ -265,11 +297,14 @@ class CustomProvider(
          * 错误说明带 HTTP 状态与响应片段——站点对请求头/密钥的拒绝原因通常写在响应体里，
          * 直接透出给用户，不能吞成「没拉到模型」。
          */
-        fun fetchModelsResult(baseUrl: String, apiKey: String, headers: Map<String, String>): Pair<List<String>, String> {
+        fun fetchModelsResult(baseUrl: String, apiKey: String, headers: Map<String, String>, wireLog: ProviderWireLog? = null): Pair<List<String>, String> {
             if (baseUrl.isBlank()) return emptyList<String>() to "接口地址为空"
+            val url = modelsUrl(baseUrl)
+            wireLog?.brief("拉模型 → GET $url（自定义头 ${headers.size} 条）")
             val conn = try {
-                openConnection(modelsUrl(baseUrl), apiKey, null, "GET", headers)
+                openConnection(url, apiKey, null, "GET", headers)
             } catch (e: Exception) {
+                wireLog?.brief("拉模型 ← 连接失败：${e.message ?: e.javaClass.simpleName}")
                 return emptyList<String>() to "连接失败：${e.message ?: e.javaClass.simpleName}"
             }
             return try {
@@ -277,7 +312,11 @@ class CustomProvider(
                 if (status !in 200..299) {
                     val body = runCatching { readLimited(conn.errorStream) }.getOrDefault("")
                     val hint = if (status == 404) "（模型端点 404：确认接口地址是否要到 /v1）" else ""
+                    wireLog?.brief("拉模型 ← HTTP $status：${extractBrief(body)}")
+                    wireLog?.verbose?.invoke("拉模型错误原文", body)
                     emptyList<String>() to "HTTP $status$hint${extractBrief(body)}"
+                } else {
+                    wireLog?.brief("拉模型 ← HTTP $status")
                 }
                 val text = readLimited(conn.inputStream)
                 val obj = runCatching { JsonParser.parseString(text).asJsonObject }.getOrNull()
@@ -358,6 +397,9 @@ class CustomProvider(
         /** 展开头值里的 `{key}` 占位符——多账号轮询时每个账号带自己的密钥。 */
         private fun expandValue(value: String, key: String): String =
             if (value.contains("{key}")) value.replace("{key}", key) else value
+
+        private fun mask(value: String): String =
+            if (value.length <= 12) "****" else value.take(4) + "****" + value.takeLast(4)
 
         private fun modelsUrl(baseUrl: String): String {
             val base = baseUrl.trim().trimEnd('/')

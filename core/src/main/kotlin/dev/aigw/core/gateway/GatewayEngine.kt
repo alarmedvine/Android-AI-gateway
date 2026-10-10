@@ -410,6 +410,10 @@ class GatewayEngine(
                 dev.aigw.core.provider.custom.CustomProvider(
                     config = config,
                     nowMillis = nowMillis,
+                    wireLog = dev.aigw.core.provider.custom.ProviderWireLog(
+                        brief = { text -> log("自定义供应商「${config.name}」$text") },
+                        verbose = { tag, text -> logVerbose(tag, text) },
+                    ),
                 ),
             )
         }
