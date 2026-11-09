@@ -38,7 +38,10 @@ import dev.aigw.core.gateway.ModelsCatalog
 import dev.aigw.core.gateway.ProviderInfo
 import dev.aigw.core.gateway.ProviderModelsChunk
 import dev.aigw.core.gateway.ProviderSettings
+import dev.aigw.core.gateway.ProxyProfile
+import dev.aigw.core.gateway.ProxyProbeResult
 import dev.aigw.core.gateway.ProxySettings
+import dev.aigw.core.gateway.ProxyTarget
 import dev.aigw.core.pool.AccountStatus
 import dev.aigw.core.pool.PoolSummary
 import dev.aigw.core.provider.ACTION_CHECKIN
@@ -132,6 +135,19 @@ class AppearanceStore(private val store: KeyValueStore) {
         store.delete(KEY_BG)
         store.delete(KEY_GOLD_START)
         store.delete(KEY_GOLD_END)
+        store.delete(KEY_FLOATING_NAV)
+    }
+
+    /**
+     * 底部导航悬浮样式开关：默认**关闭**。
+     *
+     * 跟动态取色一样属于主题的一部分，所以放在同页；但默认关：贴边底栏是默认布局，
+     * 悬浮是可选项，不应该因为升级就改变用户已习惯的位置。
+     */
+    fun floatingNavBar(): Boolean = store.read(KEY_FLOATING_NAV) == "1"
+
+    fun setFloatingNavBar(enabled: Boolean) {
+        store.write(KEY_FLOATING_NAV, if (enabled) "1" else "0")
     }
 
     companion object {
@@ -143,6 +159,7 @@ class AppearanceStore(private val store: KeyValueStore) {
         private const val KEY_BG = "settings/appearance.backgroundHex"
         private const val KEY_GOLD_START = "settings/appearance.goldStartHex"
         private const val KEY_GOLD_END = "settings/appearance.goldEndHex"
+        private const val KEY_FLOATING_NAV = "settings/appearance.floatingNavBar"
     }
 }
 
@@ -199,6 +216,12 @@ sealed interface ModelTestStatus {
     data object Testing : ModelTestStatus
     data class Success(val latencyMs: Long) : ModelTestStatus
     data class Failed(val reason: String) : ModelTestStatus
+}
+
+/** 代理连通性测试状态（键为配置 id，见 [AppUiState.proxyProbeResults]）。 */
+sealed interface ProxyProbeState {
+    data object Testing : ProxyProbeState
+    data class Done(val result: ProxyProbeResult) : ProxyProbeState
 }
 
 /**
@@ -265,6 +288,10 @@ data class AppUiState(
     val modelLoadStates: Map<String, ModelLoadState> = emptyMap(),
     /** 模型测速状态，键为 `model.fullId`。 */
     val modelTestLatencies: Map<String, ModelTestStatus> = emptyMap(),
+    /** 代理页的候选路由（供应商或供应商×区域），启动与供应商变动后刷新。 */
+    val proxyTargets: List<ProxyTarget> = emptyList(),
+    /** 代理连通性测试结果，键为配置 id。 */
+    val proxyProbeResults: Map<String, ProxyProbeState> = emptyMap(),
     val calls: List<CallRecord> = emptyList(),
     /** 存储中的记录条数（含未载入内存的）。 */
     val storedCalls: Int = 0,
@@ -332,6 +359,12 @@ data class AppUiState(
     val middleware: dev.aigw.core.gateway.MiddlewareSettings = dev.aigw.core.gateway.MiddlewareSettings(),
     /** 各改写中间件最近一次失败原因，键为中间件 id。 */
     val middlewareFailures: Map<String, String> = emptyMap(),
+    /** 首页组件顺序（含被隐藏的项，隐藏态看 [homeHidden]）。 */
+    val homeOrder: List<HomeWidget> = HomeWidget.entries,
+    /** 首页被隐藏的组件。 */
+    val homeHidden: Set<HomeWidget> = emptySet(),
+    /** 底部导航是否悬浮（主题设置里的开关，默认关闭）。 */
+    val floatingNavBar: Boolean = false,
 ) {
     /** 某个供应商的账号。 */
     fun accountsOf(providerId: String): List<AccountStatus> = accounts.filter { it.providerId == providerId }
@@ -355,6 +388,7 @@ private class Snapshot(
     val logs: List<LogLine>,
     val settings: GatewaySettings,
     val proxy: ProxySettings,
+    val proxyTargets: List<ProxyTarget>,
     val keepAlive: KeepAliveStatus,
     val security: dev.aigw.core.security.SecuritySettings,
     val evidences: List<dev.aigw.core.security.OutboundEvidence>,
@@ -378,6 +412,7 @@ class AppViewModel(
 
     private val appearance = AppearanceStore(engine.store())
     private val updateStore = UpdateStore(engine.store())
+    private val homeLayout = HomeLayoutStore(engine.store())
 
     private val _state = MutableStateFlow(
         AppUiState(
@@ -388,6 +423,9 @@ class AppViewModel(
             backgroundOverride = appearance.backgroundHex()?.let { parseHexColor(it) },
             goldStart = parseHexColor(appearance.goldStartHex()) ?: defaultAppColors.goldStart,
             goldEnd = parseHexColor(appearance.goldEndHex()) ?: defaultAppColors.goldEnd,
+            homeOrder = homeLayout.order(),
+            homeHidden = homeLayout.hidden(),
+            floatingNavBar = appearance.floatingNavBar(),
         ),
     )
     val state: StateFlow<AppUiState> = _state.asStateFlow()
@@ -418,6 +456,7 @@ class AppViewModel(
     @Volatile
     private var modelsFetchedAt = 0L
 
+    /** 在途请求快照签名：只在内容真正变化时写入 state，避免每帧重组拓扑卡。 */
     private var lastActiveSignature = ""
     private val activeRequestsListener: (List<dev.aigw.core.gateway.ActiveRequest>) -> Unit = { list ->
         val sig = list.joinToString(";") { "${it.id}:${it.providerId}:${it.phase}" }
@@ -501,6 +540,7 @@ class AppViewModel(
                     logs = engine.requestLog.lines(),
                     settings = engine.settings(),
                     proxy = engine.proxySettings(),
+                    proxyTargets = engine.proxyTargets(),
                     keepAlive = KeepAlive.status(app),
                     security = engine.securitySettings(),
                     evidences = engine.sanitizer.evidenceList(),
@@ -533,6 +573,7 @@ class AppViewModel(
                 logs = snapshot.logs,
                 settings = snapshot.settings,
                 proxy = snapshot.proxy,
+                proxyTargets = snapshot.proxyTargets,
                 keepAlive = snapshot.keepAlive,
                 security = snapshot.security,
                 evidences = snapshot.evidences,
@@ -1031,7 +1072,7 @@ class AppViewModel(
         }
     }
 
-    /** 恢复默认外观（明暗模式、页面底色、金色渐变）。 */
+    /** 恢复默认外观（明暗模式、页面底色、金色渐变、悬浮底栏）。 */
     fun resetAppearance() {
         persistAppearanceJob?.cancel()
         _state.value = _state.value.copy(
@@ -1039,10 +1080,33 @@ class AppViewModel(
             backgroundOverride = null,
             goldStart = defaultAppColors.goldStart,
             goldEnd = defaultAppColors.goldEnd,
+            floatingNavBar = false,
         )
         viewModelScope.launch {
             withContext(Dispatchers.IO) { appearance.reset() }
             _state.value = _state.value.copy(notice = "外观主题已恢复默认")
+        }
+    }
+
+    /** 底部导航悬浮开关。 */
+    fun setFloatingNavBar(enabled: Boolean) {
+        _state.value = _state.value.copy(floatingNavBar = enabled)
+        viewModelScope.launch { withContext(Dispatchers.IO) { appearance.setFloatingNavBar(enabled) } }
+    }
+
+    /**
+     * 保存首页布局：顺序与隐藏项一起落盘。
+     *
+     * 编辑模式下每次拖动/删除都调一次（FlClash 也是拖完即落盘），
+     * 这样中途退出或进程被杀都不会丢掉刚才的调整。
+     */
+    fun saveHomeLayout(order: List<HomeWidget>, hidden: Set<HomeWidget>) {
+        _state.value = _state.value.copy(homeOrder = order, homeHidden = hidden)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                homeLayout.setOrder(order)
+                homeLayout.setHidden(hidden)
+            }
         }
     }
 
@@ -1626,6 +1690,59 @@ class AppViewModel(
     fun updateProxySettings(settings: ProxySettings) {
         _state.value = _state.value.copy(proxy = settings)
         viewModelScope.launch { withContext(Dispatchers.IO) { engine.updateProxySettings(settings) } }
+    }
+
+    /** 新增或更新一套代理配置（保存后立即成为当前使用的配置）。 */
+    fun saveProxyProfile(profile: ProxyProfile) {
+        updateProxySettings(_state.value.proxy.upsertProfile(profile))
+    }
+
+    fun removeProxyProfile(id: String) {
+        updateProxySettings(_state.value.proxy.removeProfile(id))
+        val results = _state.value.proxyProbeResults - id
+        _state.value = _state.value.copy(proxyProbeResults = results)
+    }
+
+    fun activateProxyProfile(id: String) {
+        updateProxySettings(_state.value.proxy.copy(activeProfileId = id))
+    }
+
+    /** 勾选/取消某个路由（供应商或供应商×区域）走代理。 */
+    fun toggleProxyRoute(routeKey: String, proxied: Boolean) {
+        val current = _state.value.proxy
+        // 白名单里的 `*` 要先展开成具体路由：否则取消单项后 `*` 仍把它命中，开关看起来没反应
+        val base = if (ProxySettings.ALL_ROUTES in current.proxiedRoutes) {
+            _state.value.proxyTargets.map { it.routeKey }.toSet()
+        } else {
+            current.proxiedRoutes
+        }
+        val routes = if (proxied) base + routeKey else base - routeKey
+        updateProxySettings(current.copy(proxiedRoutes = routes))
+    }
+
+    fun toggleAllProxyRoutes(proxied: Boolean) {
+        val current = _state.value.proxy
+        if (!proxied) {
+            updateProxySettings(current.copy(proxiedRoutes = emptySet()))
+            return
+        }
+        // 全选落到具体路由键，而不是 `*`：之后新增的供应商不应被默默纳入代理
+        val all = current.proxiedRoutes.filterNot { it == ProxySettings.ALL_ROUTES }.toSet() +
+            _state.value.proxyTargets.map { it.routeKey }
+        updateProxySettings(current.copy(proxiedRoutes = all))
+    }
+
+    /** 测试一套代理配置的连通性；结果保留在状态里供页面展示。 */
+    fun testProxyProfile(id: String) {
+        _state.value = _state.value.copy(
+            proxyProbeResults = _state.value.proxyProbeResults + (id to ProxyProbeState.Testing),
+        )
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { engine.probeProxyProfile(id) }
+            _state.value = _state.value.copy(
+                proxyProbeResults = _state.value.proxyProbeResults + (id to ProxyProbeState.Done(result)),
+            )
+        }
     }
 
     // ------------------------------------------------------------------ 额度包
