@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   release:
+    # 分支上的 workflow_dispatch 绝不能发版：会把分支包覆盖进同名 tag 的 Release，
+    # 应用内更新随即装到与用户当前包不同树的产物。分支验证请用 build-release.yml（只出 artifact）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
