@@ -1,0 +1,250 @@
+name: 同步上游并发布 APK
+
+# fork 专用自动化（alarmedvine/Android-AI-gateway）：
+#   1) 定时（默认每小时）把上游 xibai6668/Android-AI-gateway 的 main 合并进本仓库 main；
+#   2) 合并后若 app/build.gradle.kts 的 versionName 还没有对应 Release，就用本仓库的
+#      keystore 构建 release APK 并发版（应用内更新读的就是本仓库的 releases/latest）。
+#
+# 两个 fork 独有提交（上游不存在的文件/行，合并时不会冲突）：
+#   - .github/workflows/sync-release.yml（本文件）
+#   - core/.../update/UpdateSource.kt 的更新源指向 alarmedvine（见下方「更新源」步骤注释）
+# 唯一已知的可冲突点：上游若改到 UpdateSource.kt 的同一行，下面会按「取上游 + 重写回 fork
+# 地址」自动化解；若上游把地址格式整体换掉，则直接失败并开 issue，绝不静默发出跨签名包。
+on:
+  schedule:
+    - cron: '17 * * * *'   # 每小时一次（UTC，避开整点），并按需在仓库设置里关闭
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: '即使当前版本已发过也重新构建并发版'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: xibai6668/Android-AI-gateway
+  FORK_REPO: alarmedvine/Android-AI-gateway
+  UPDATE_SOURCE: core/src/main/kotlin/dev/aigw/core/update/UpdateSource.kt
+
+jobs:
+  sync:
+    name: 同步上游
+    runs-on: ubuntu-latest
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+      head_sha: ${{ steps.head.outputs.head }}
+      version: ${{ steps.decide.outputs.version }}
+      need_release: ${{ steps.decide.outputs.need_release }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: 记录合并前的 main
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+
+      - name: 合并上游 main
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "上游没有新提交，本地 $(git rev-parse --short HEAD) 已包含 upstream/main"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-ff --no-edit upstream/main; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            CONFLICTS="$(git diff --name-only --diff-filter=U)"
+            echo "冲突文件：${CONFLICTS}"
+            # 已知且唯一的预期冲突：上游改了 UpdateSource.kt 的同一行。
+            # 处理口径 = 取上游版本，再把更新源重写回本 fork（下面「更新源」步骤统一校验）。
+            if [ "${CONFLICTS}" = "${UPDATE_SOURCE}" ]; then
+              git checkout --theirs -- "${UPDATE_SOURCE}"
+              sed -i 's#xibai6668/Android-AI-gateway#alarmedvine/Android-AI-gateway#g' "${UPDATE_SOURCE}"
+              if grep -q 'alarmedvine/Android-AI-gateway' "${UPDATE_SOURCE}" &&
+                 ! grep -q 'xibai6668/Android-AI-gateway' "${UPDATE_SOURCE}"; then
+                git add -- "${UPDATE_SOURCE}"
+                git commit --no-edit
+                echo "merged=true(resolved UpdateSource.kt)" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error file=${UPDATE_SOURCE}::上游已改写更新源地址格式，无法自动重写，需人工处理"
+                git merge --abort || true
+                exit 1
+              fi
+            else
+              echo "::error::上游合并出现非预期冲突，需人工处理"
+              git merge --abort || true
+              exit 1
+            fi
+          fi
+
+          # 兜底断言：合并后源码里的更新源必须指回本 fork，否则应用内更新会去下上游的包
+          #（签名不同 → 安装必然失败，用户只看到「应用未安装」）。
+          if grep -q 'xibai6668/Android-AI-gateway' "${UPDATE_SOURCE}"; then
+            echo "::error file=${UPDATE_SOURCE}::合并后更新源指向上游，拒绝推送"
+            exit 1
+          fi
+
+          git push origin HEAD:main
+          git --no-pager log --oneline -10
+
+      - name: 记录合并后的 main
+        id: head
+        run: echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: 判定是否需要发版
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"(.*)".*/\1/')"
+          CODE="$(grep -m1 'versionCode' app/build.gradle.kts | sed -E 's/[^0-9]//g')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "当前源码版本：v${VERSION}（versionCode ${CODE}）"
+
+          if [ "${{ inputs.force_release }}" = "true" ]; then
+            echo "手动要求强制重建 → 发版"
+            echo "need_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh api "repos/${FORK_REPO}/releases/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "v${VERSION} 已发过 → 只同步，不发版"
+            echo "need_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v${VERSION} 尚未发版 → 构建并发布"
+            echo "need_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 失败时开 issue 提醒
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="上游自动同步失败（$(date -u +%Y-%m-%d)）"
+          if gh issue list --state open --search "in:title 上游自动同步失败" --json number --jq 'length' | grep -q '^0$'; then
+            gh issue create --title "$TITLE" \
+              --body "自动同步上游或判定发版时失败，请查看运行日志：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+          else
+            echo "已有未关闭的同步失败 issue，跳过创建"
+          fi
+
+  release:
+    name: 构建并发布 v${{ needs.sync.outputs.version }}
+    needs: sync
+    if: needs.sync.outputs.need_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;35.0.0'
+
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.11.1'
+
+      - name: 还原 release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.keystore"
+
+      - name: 生成 keystore.properties
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cat > keystore.properties <<EOF
+          storeFile=$GITHUB_WORKSPACE/release.keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: 校验更新源指向本 fork
+        run: |
+          set -euo pipefail
+          grep -n 'alarmedvine/Android-AI-gateway' "${UPDATE_SOURCE}"
+          if grep -q 'xibai6668/Android-AI-gateway' "${UPDATE_SOURCE}"; then
+            echo "::error::更新源指向上游，构建出来的包会去下载异构签名的 APK"
+            exit 1
+          fi
+
+      - name: 单元测试
+        run: gradle :core:test --console=plain
+
+      - name: 打包 release
+        run: gradle :app:assembleRelease --console=plain
+
+      - name: 产物验真（dex 里的更新源）
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          unzip -p "$APK" 'classes*.dex' > /tmp/all.dex
+          if ! grep -aq 'repos/alarmedvine/Android-AI-gateway/releases/latest' /tmp/all.dex; then
+            echo "::error::APK 内找不到 fork 更新源，产物不可用于应用内更新"
+            exit 1
+          fi
+          if grep -aq 'repos/xibai6668/Android-AI-gateway/releases/latest' /tmp/all.dex; then
+            echo "::error::APK 内仍含上游更新源"
+            exit 1
+          fi
+          echo "dex 更新源校验通过"
+
+      - name: 重命名产物
+        run: cp app/build/outputs/apk/release/app-release.apk "ai-gateway-${{ needs.sync.outputs.version }}-release.apk"
+
+      - name: 生成更新日志
+        id: changelog
+        env:
+          BASE: ${{ needs.sync.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          LOG="$(git log "${BASE}..HEAD" --no-merges --pretty='- %s' -- app core || true)"
+          [ -n "$LOG" ] || LOG="- 无应用相关变化"
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "## 更新内容（${{ needs.sync.outputs.version }}）"
+            echo ""
+            echo "$LOG"
+            echo ""
+            echo "> 本包由 fork 自动构建，签名与上游不同：不能覆盖安装上游的包（需先卸载），"
+            echo "> 应用内更新已指向本仓库的 Release。"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release 并上传 APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.sync.outputs.version }}
+          target_commitish: ${{ needs.sync.outputs.head_sha }}
+          name: v${{ needs.sync.outputs.version }}
+          body: ${{ steps.changelog.outputs.body }}
+          files: ai-gateway-${{ needs.sync.outputs.version }}-release.apk
