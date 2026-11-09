@@ -85,7 +85,7 @@ fun isNewerVersion(remote: String, local: String): Boolean {
  */
 object UpdateRepository {
 
-    private const val API = "https://api.github.com/repos/xibai6668/Android-AI-gateway/releases/latest"
+    private const val API = "https://api.github.com/repos/alarmedvine/Android-AI-gateway/releases/latest"
     private const val UA = "ai-gateway-android"
 
     fun fetchLatest(
@@ -125,7 +125,7 @@ object UpdateRepository {
         val obj = JsonParser.parseString(body).asJsonObject
         val version = obj.str("tag_name").trim().removePrefix("v")
         if (version.isEmpty()) throw IllegalStateException("未找到版本信息")
-        val pageUrl = obj.str("html_url").ifEmpty { "https://github.com/xibai6668/Android-AI-gateway/releases" }
+        val pageUrl = obj.str("html_url").ifEmpty { "https://github.com/alarmedvine/Android-AI-gateway/releases" }
         val notes = obj.str("body").trim()
         // 发版产物固定命名为 ai-gateway-<version>-release.apk；没有就退回最大的 .apk 资产
         val assets = obj.arrayOrNull("assets")?.mapNotNull { it.takeIf { a -> a.isJsonObject }?.asJsonObject }.orEmpty()
