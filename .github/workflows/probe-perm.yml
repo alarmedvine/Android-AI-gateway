@@ -1,0 +1,29 @@
+name: probe-perm
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: create draft release with GITHUB_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "--- token perms (headers) ---"
+          curl -s -D - -o /dev/null -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}" | grep -i -E '^x-oauth-scopes|^x-accepted-oauth|^HTTP'
+          echo "--- repo perms object ---"
+          curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("permissions"))'
+          echo "--- POST releases (draft) ---"
+          curl -s -o /tmp/o.json -w 'HTTP %{http_code}\n' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d '{"tag_name":"probe-perm-delete-me","name":"probe","draft":true,"target_commitish":"main"}'
+          head -c 500 /tmp/o.json
+          echo
+          echo "--- POST release for existing tag v2.36.4 ---"
+          curl -s -o /tmp/o2.json -w 'HTTP %{http_code}\n' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d '{"tag_name":"probe-perm-delete-me2","name":"probe2","draft":true,"target_commitish":"48a8580aa4f9ce7a4f03cd4403b00866b81b6b95"}'
+          head -c 500 /tmp/o2.json
