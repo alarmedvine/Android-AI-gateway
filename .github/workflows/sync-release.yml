@@ -75,9 +75,23 @@ jobs:
           else
             CONFLICTS="$(git diff --name-only --diff-filter=U)"
             echo "冲突文件：${CONFLICTS}"
-            # 已知且唯一的预期冲突：上游改了 UpdateSource.kt 的同一行。
-            # 处理口径 = 取上游版本，再把更新源重写回本 fork（下面「更新源」步骤统一校验）。
-            if [ "${CONFLICTS}" = "${UPDATE_SOURCE}" ]; then
+            BASE_SHA_EARLY="${{ steps.base.outputs.sha }}"
+            # 冲突全落在 .github/workflows 时，一律取 fork 的版本（= 合并前状态）。
+            # 该目录本来就在下面被整块回退，这里只是让 merge 能继续走完。
+            if [ -n "${CONFLICTS}" ] &&
+               [ "$(printf '%s\n' "${CONFLICTS}" | grep -cv '^\.github/workflows/' || true)" = "0" ]; then
+              echo "冲突全在 .github/workflows，取 fork 版本继续合并"
+              for f in ${CONFLICTS}; do
+                if git cat-file -e "${BASE_SHA_EARLY}:${f}" 2>/dev/null; then
+                  git checkout "${BASE_SHA_EARLY}" -- "${f}"
+                else
+                  git rm -q -f -- "${f}"
+                fi
+              done
+              git add -A -- .github/workflows
+              git commit --no-edit
+              echo "merged=true(resolved .github/workflows)" >> "$GITHUB_OUTPUT"
+            elif [ "${CONFLICTS}" = "${UPDATE_SOURCE}" ]; then
               git checkout --theirs -- "${UPDATE_SOURCE}"
               sed -i 's#xibai6668/Android-AI-gateway#alarmedvine/Android-AI-gateway#g' "${UPDATE_SOURCE}"
               if grep -q 'alarmedvine/Android-AI-gateway' "${UPDATE_SOURCE}" &&
@@ -119,8 +133,21 @@ jobs:
 
           # 兜底断言：合并后源码里的更新源必须指回本 fork，否则应用内更新会去下上游的包
           #（签名不同 → 安装必然失败，用户只看到「应用未安装」）。
+          # 上游若改了 UpdateSource.kt 但没和 fork 的改动撞行，merge 会静默取上游值（无冲突）——
+          # 这时自动改写回 fork 地址并 amend；改不成就失败，绝不静默推出去。
           if grep -q 'xibai6668/Android-AI-gateway' "${UPDATE_SOURCE}"; then
-            echo "::error file=${UPDATE_SOURCE}::合并后更新源指向上游，拒绝推送"
+            echo "合并后更新源指向上游，自动改写回 ${FORK_REPO}"
+            sed -i "s#xibai6668/Android-AI-gateway#${FORK_REPO}#g" "${UPDATE_SOURCE}"
+            if grep -q 'xibai6668/Android-AI-gateway' "${UPDATE_SOURCE}" ||
+               ! grep -q "${FORK_REPO}" "${UPDATE_SOURCE}"; then
+              echo "::error file=${UPDATE_SOURCE}::上游已改写更新源地址格式，无法自动重写，需人工处理"
+              exit 1
+            fi
+            git add -- "${UPDATE_SOURCE}"
+            git commit --amend --no-edit
+          fi
+          if ! grep -q "${FORK_REPO}" "${UPDATE_SOURCE}"; then
+            echo "::error file=${UPDATE_SOURCE}::更新源未指向本 fork，拒绝推送"
             exit 1
           fi
 
