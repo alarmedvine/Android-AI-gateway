@@ -9,23 +9,19 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: variants
+      - name: tag-then-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          post() {  # $1=tag $2=target commitish
-            printf '%-30s %-12s ' "$1" "$2"
-            curl -s -o /tmp/o.json -w 'HTTP %{http_code} ' -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases" \
-              -d "{\"tag_name\":\"$1\",\"name\":\"$1\",\"draft\":true,\"target_commitish\":\"$2\"}"
-            python3 -c 'import json;d=json.load(open("/tmp/o.json"));print(d.get("message","OK id="+str(d.get("id"))))'
-          }
-          echo "== 复现失败的精确参数（tag v2.37.1 + 48a8580）=="
-          post v2.37.1 48a8580aa4f9ce7a4f03cd4403b00866b81b6b95
-          echo "== 同一 tag 换 branch 名 =="
-          post probe-f main
-          echo "== 老 ancestor commit 456e13c =="
-          post probe-g 456e13c821a0a0d5d0a9a2b6f9b1b3b8f8b0a1c2
-          echo "== 当前 tip =="
-          post probe-h 2347e5455b2e0ead6e302e324996a58074782848
+          set -euo pipefail
+          OLD=456e13c821f0e0e0d1e0c8f0e1b6a1e0e0e0e0e0
+          OLD=$(git rev-parse 456e13c)
+          echo "候选非 tip commit: $OLD  当前 tip: $(git rev-parse HEAD)"
+          git tag probe-k "$OLD"
+          git push -q origin probe-k && echo "tag probe-k pushed -> $OLD"
+          printf 'POST release (existing tag, 无 target_commitish): '
+          curl -s -o /tmp/o.json -w 'HTTP %{http_code} ' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d '{"tag_name":"probe-k","name":"probe-k","draft":false}'
+          python3 -c 'import json;d=json.load(open("/tmp/o.json"));print(d.get("message","OK id="+str(d.get("id"))+" tag_target="+str(d.get("target_commitish"))))'
