@@ -247,9 +247,11 @@ jobs:
         id: changelog
         env:
           BASE: ${{ needs.sync.outputs.base_sha }}
+          TARGET: ${{ needs.sync.outputs.head_sha }}
         run: |
           set -euo pipefail
-          LOG="$(git log "${BASE}..HEAD" --no-merges --pretty='- %s' -- app core || true)"
+          # 用合并提交（TARGET）而不是 HEAD 作为上界：release job 的 checkout 可能比合并提交新。
+          LOG="$(git log "${BASE}..${TARGET}" --no-merges --pretty='- %s' -- app core || true)"
           [ -n "$LOG" ] || LOG="- 无应用相关变化"
           {
             echo "body<<CHANGELOG_EOF"
@@ -262,11 +264,32 @@ jobs:
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # GITHUB_TOKEN 的两个权限边界（2026-11-13 实测，勿再踩）：
+      #   ①不能推送 .github/workflows 下的变更 → 由 sync job 回退该目录解决；
+      #   ②带 target_commitish=<commit sha> 建 Release 会 403（"Resource not accessible by
+      #     integration"），target_commitish=main 或省略则 201。所以这里**不用** softprops 的
+      #     target_commitish（它总带），改为：先用 GITHUB_TOKEN 打 tag（tag 指向合并提交，
+      #     指向权在 tag 上），再用 tag_name 建 Release（省略 target_commitish）。
+      - name: 打 tag（指向合并提交）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.sync.outputs.version }}
+          TARGET: ${{ needs.sync.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} 已存在，指向 $(git rev-list -n1 "${TAG}")"
+          else
+            git tag "${TAG}" "${TARGET}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
       - name: 创建 Release 并上传 APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.sync.outputs.version }}
-          target_commitish: ${{ needs.sync.outputs.head_sha }}
           name: v${{ needs.sync.outputs.version }}
           body: ${{ steps.changelog.outputs.body }}
           files: ai-gateway-${{ needs.sync.outputs.version }}-release.apk
