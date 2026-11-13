@@ -10,6 +10,8 @@ name: 同步上游并发布 APK
 #   - core/.../update/UpdateSource.kt 的更新源指向 alarmedvine（见下方「更新源」步骤注释）
 # 唯一已知的可冲突点：上游若改到 UpdateSource.kt 的同一行，下面会按「取上游 + 重写回 fork
 # 地址」自动化解；若上游把地址格式整体换掉，则直接失败并开 issue，绝不静默发出跨签名包。
+# 另一条硬限制：GITHUB_TOKEN 没有 workflows 权限（官方可用权限清单里没有这一项），所以上游
+# 对 .github/workflows/** 的任何改动都会让 push 被拒 —— 合并后该目录一律回退到 fork 版本。
 on:
   schedule:
     - cron: '17 * * * *'   # 每小时一次（UTC，避开整点），并按需在仓库设置里关闭
@@ -104,6 +106,8 @@ jobs:
           if ! git diff --quiet "${BASE_SHA}" -- .github/workflows; then
             echo "上游改动了 .github/workflows，回退到 fork 版本（GITHUB_TOKEN 无权推送 workflow 变更）："
             git --no-pager diff --stat "${BASE_SHA}" -- .github/workflows
+            # 先清空再取回：checkout 只会覆盖/新增，删不掉上游**新增**的 workflow 文件。
+            git rm -r -q --ignore-unmatch -- .github/workflows
             git checkout "${BASE_SHA}" -- .github/workflows
             git commit --amend --no-edit
           fi
