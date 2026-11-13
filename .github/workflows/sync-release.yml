@@ -95,6 +95,24 @@ jobs:
             fi
           fi
 
+          # GITHUB_TOKEN 没有 workflows 权限（官方「可用权限清单」里根本没有 workflows 这一项），
+          # 一旦上游改动 .github/workflows/*** 下的任何文件，push 就会被
+          # "refusing to allow a GitHub App to create or update workflow ... without `workflows` permission" 直接拒绝。
+          # 本 fork 的发版流水线完全由本文件驱动，上游 workflow 的改动对 fork 没有意义，
+          # 因此把该目录整块回退到合并前的状态：推送的树里 workflow 与远端 main 逐字节一致 → 不再触发该限制。
+          BASE_SHA="${{ steps.base.outputs.sha }}"
+          if ! git diff --quiet "${BASE_SHA}" -- .github/workflows; then
+            echo "上游改动了 .github/workflows，回退到 fork 版本（GITHUB_TOKEN 无权推送 workflow 变更）："
+            git --no-pager diff --stat "${BASE_SHA}" -- .github/workflows
+            git checkout "${BASE_SHA}" -- .github/workflows
+            git commit --amend --no-edit
+          fi
+          # 自证：回退后工作树里的 workflow 必须与合并前逐字节一致，否则不带 workflows 权限的推送必然失败。
+          if ! git diff --quiet "${BASE_SHA}" -- .github/workflows; then
+            echo "::error::.github/workflows 回退失败，推送会被 GitHub 拒绝"
+            exit 1
+          fi
+
           # 兜底断言：合并后源码里的更新源必须指回本 fork，否则应用内更新会去下上游的包
           #（签名不同 → 安装必然失败，用户只看到「应用未安装」）。
           if grep -q 'xibai6668/Android-AI-gateway' "${UPDATE_SOURCE}"; then
