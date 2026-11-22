@@ -205,12 +205,47 @@ class PromptRiskRewriterTest {
     }
 
     @Test
-    fun `内置规则覆盖了 Antigravity 与 WorkBuddy 两组`() {
+    fun `内置规则分为 Antigravity、WorkBuddy 与通用三组`() {
         val sets = PromptRiskRewriter.builtinRuleSets()
-        assertTrue(sets.containsKey("Antigravity"))
-        assertTrue(sets.containsKey("WorkBuddy"))
-        assertTrue(sets.getValue("Antigravity").size >= 8, "Antigravity 规则偏少：${sets.getValue("Antigravity").size}")
-        assertTrue(sets.getValue("WorkBuddy").size >= 4, "WorkBuddy 规则偏少：${sets.getValue("WorkBuddy").size}")
+        assertEquals(setOf("Antigravity", "WorkBuddy", "通用"), sets.keys)
+        // 用精确值而非 >=：规则被误移到别的组时，宽松断言查不出来。
+        assertEquals(4, sets.getValue("Antigravity").size)
+        assertEquals(4, sets.getValue("WorkBuddy").size)
+        assertEquals(7, sets.getValue("通用").size)
+    }
+
+    @Test
+    fun `WorkBuddy 的 DSH 宿主指纹归在 WorkBuddy 组`() {
+        // 这两条来自 CodeBuddyProvider 的 HOST_FINGERPRINTS，是 WorkBuddy 上游的检测点。
+        val sets = PromptRiskRewriter.builtinRuleSets()
+        val workbuddyPatterns = sets.getValue("WorkBuddy").map { it.pattern }
+
+        assertTrue("DeepSeek Runtime" in workbuddyPatterns)
+        assertTrue("DeepSeek Harness" in workbuddyPatterns)
+    }
+
+    @Test
+    fun `两家共有的指纹放在通用组，关掉任一供应商预设都不会失效`() {
+        // Claude Code / Codex / 计费头这些同时在 WorkBuddy 的 FLAGGED_TEXT 与反重力检测里，
+        // 若归到单个供应商组，关掉那组会把另一家的保护一起带走。
+        val s = PromptRiskRewriter { 0L }.apply {
+            reload(presets = setOf("通用"), custom = emptyList())
+        }
+        val (rewritten, matched) = s.rewriteText("You are Claude Code, Anthropic's official CLI for Claude")
+
+        assertTrue(matched.isNotEmpty(), "只开通用组时共有指纹仍应生效")
+        assertFalse(rewritten.contains("official", ignoreCase = true))
+    }
+
+    @Test
+    fun `关掉 WorkBuddy 预设后 DSH 规则不再生效`() {
+        val s = PromptRiskRewriter { 0L }.apply {
+            reload(presets = setOf("Antigravity"), custom = emptyList())
+        }
+        val (rewritten, matched) = s.rewriteText("powered by DeepSeek Harness")
+
+        assertEquals("powered by DeepSeek Harness", rewritten)
+        assertTrue(matched.isEmpty(), "WorkBuddy 预设关闭后 DSH 规则不应再命中：$matched")
     }
 
     @Test
@@ -276,5 +311,97 @@ class PromptRiskRewriterTest {
         )
         assertTrue(instruction.contains("This assistant helps users"))
         assertTrue(instruction.contains("Be terse."), "同段其它指令要保留：$instruction")
+    }
+
+    @Test
+    fun `被禁用的内置规则不再生效，其它规则不受影响`() {
+        val s = PromptRiskRewriter { 0L }.apply {
+            reload(
+                presets = PromptRiskRewriter.builtinRuleSets().keys,
+                custom = emptyList(),
+                disabledBuiltin = setOf("通用/project root 词组"),
+            )
+        }
+
+        val (kept, matchedKept) = s.rewriteText("the user did not write this")
+        assertTrue(matchedKept.isNotEmpty(), "同组其它规则应继续生效")
+        assertTrue(kept.contains("the operator did not author"))
+
+        val (still, matched) = s.rewriteText("put it in the project root")
+        assertEquals("put it in the project root", still)
+        assertTrue(matched.isEmpty(), "被禁用的规则不应再命中：$matched")
+    }
+
+    @Test
+    fun `自定义规则不受内置禁用列表影响`() {
+        val custom = PromptRule("自定义/测试", "a custom trigger", "a neutral phrase")
+        val s = PromptRiskRewriter { 0L }.apply {
+            reload(
+                presets = PromptRiskRewriter.builtinRuleSets().keys,
+                custom = listOf(custom),
+                disabledBuiltin = PromptRiskRewriter.builtinRules.map { it.name }.toSet(),
+            )
+        }
+        val (rewritten, matched) = s.rewriteText("a custom trigger")
+        assertEquals("a neutral phrase", rewritten)
+        assertEquals(listOf("自定义/测试"), matched)
+    }
+
+    @Test
+    fun `导出再导入能还原同一套自定义规则`() {
+        val original = listOf(
+            PromptRule("自定义/甲", "alpha", "beta"),
+            PromptRule("自定义/乙", "gamma", "delta"),
+        )
+        val json = PromptRiskRewriter.encodeRules(original)
+        val parsed = PromptRiskRewriter.decodeRules(json)
+
+        assertEquals(original, parsed)
+    }
+
+    @Test
+    fun `导入接受裸数组形式`() {
+        // 用户手写或从别处粘过来的文件未必带 version/rules 包装。
+        val raw = """[{"name":"自定义/甲","pattern":"alpha","replacement":"beta"}]"""
+        val parsed = PromptRiskRewriter.decodeRules(raw)
+
+        assertEquals(1, parsed?.size)
+        assertEquals("alpha", parsed?.get(0)?.pattern)
+        assertEquals("beta", parsed?.get(0)?.replacement)
+    }
+
+    @Test
+    fun `导入时缺名字的规则自动补一个可用名字`() {
+        val parsed = PromptRiskRewriter.decodeRules("""[{"pattern":"alpha","replacement":"beta"}]""")
+        assertEquals(1, parsed?.size)
+        assertTrue(parsed!![0].name.isNotEmpty())
+    }
+
+    @Test
+    fun `导入时忽略无匹配串的条目`() {
+        val parsed = PromptRiskRewriter.decodeRules(
+            """[{"name":"空","pattern":"","replacement":"x"},{"name":"正常","pattern":"a","replacement":"b"}]""",
+        )
+        assertEquals(1, parsed?.size)
+        assertEquals("正常", parsed?.get(0)?.name)
+    }
+
+    @Test
+    fun `无法解析的内容返回 null`() {
+        assertEquals(null, PromptRiskRewriter.decodeRules("not json at all"))
+        assertEquals(null, PromptRiskRewriter.decodeRules(""))
+        assertEquals(null, PromptRiskRewriter.decodeRules("{\"version\":1}"))
+    }
+
+    @Test
+    fun `禁用列表能往返序列化`() {
+        val original = SecuritySettings(
+            promptRewriteDisabledRules = listOf("通用/project root 词组", "通用/主分支括注"),
+        )
+        val parsed = SecuritySettings.fromJson(original.toJson().toString())
+
+        assertEquals(original.promptRewriteDisabledRules, parsed.promptRewriteDisabledRules)
+        assertTrue(parsed.isBuiltinRuleDisabled("通用/project root 词组"))
+        assertFalse(parsed.isBuiltinRuleDisabled("Antigravity/交互式 Agent 开场白"))
     }
 }

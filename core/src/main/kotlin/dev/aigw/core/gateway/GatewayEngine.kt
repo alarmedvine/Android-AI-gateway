@@ -431,7 +431,11 @@ class GatewayEngine(
         migrateLegacyProxyExclusions()
         installProxy()
         sanitizer.reloadPipeline(securitySettings.extraWords)
-        promptRewriter.reload(securitySettings.effectivePromptPresets(), securitySettings.promptRewriteRules)
+        promptRewriter.reload(
+            securitySettings.effectivePromptPresets(),
+            securitySettings.promptRewriteRules,
+            securitySettings.promptRewriteDisabledRules.toSet(),
+        )
         lastAutoPurgeDay = nowMillis() / DAY_MILLIS
         if (preloadCallLogs) {
             runCatching { purgeExpiredRecords() }
@@ -472,14 +476,22 @@ class GatewayEngine(
         securitySettings = updated
         store.write(dev.aigw.core.security.SecuritySettings.STORE_KEY, updated.toJson().toString())
         sanitizer.reloadPipeline(updated.extraWords)
-        promptRewriter.reload(updated.effectivePromptPresets(), updated.promptRewriteRules)
+        promptRewriter.reload(
+            updated.effectivePromptPresets(),
+            updated.promptRewriteRules,
+            updated.promptRewriteDisabledRules.toSet(),
+        )
         log("安全防护设置已更新（脱敏=${if (updated.sanitizeEnabled) "开启" else "关闭"}，限速=${updated.minIntervalMillis}ms，抖动=${updated.jitterMillis}ms）")
     }
 
     /** 重新加载脱敏处理链与规则词表。 */
     fun reloadSanitizerPipeline(): Int {
         sanitizer.reloadPipeline(securitySettings.extraWords)
-        promptRewriter.reload(securitySettings.effectivePromptPresets(), securitySettings.promptRewriteRules)
+        promptRewriter.reload(
+            securitySettings.effectivePromptPresets(),
+            securitySettings.promptRewriteRules,
+            securitySettings.promptRewriteDisabledRules.toSet(),
+        )
         val count = sanitizer.currentRulesCount()
         log("反审核脱敏处理链已重新加载，当前生效规则词汇数：$count")
         return count
@@ -751,9 +763,16 @@ class GatewayEngine(
             server?.stop()
             server = null
             requestLog.flush()
+            // 停止是最后一个能把待提交写入落盘的机会：服务被用户/系统停掉后
+            // 进程可能很快回收，合并窗口里的调用记录与用量会跟着丢。
+            store.flush()
             log("网关已停止")
         }
     }
+
+    /** 存储待提交状态（仅合并提交型存储有内容）；供 `/metrics` 与健康页展示。 */
+    fun storeFlushStats(): dev.aigw.core.store.FlushStats? =
+        (store as? dev.aigw.core.store.BatchedKeyValueStore)?.flushStats()
 
     fun isRunning(): Boolean = server != null
 
