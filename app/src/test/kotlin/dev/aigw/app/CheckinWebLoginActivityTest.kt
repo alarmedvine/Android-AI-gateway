@@ -123,7 +123,8 @@ class CheckinWebLoginActivityTest {
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
         val shadow = shadowOf(view)
         assertTrue(shadow.lastEvaluatedJavascript.contains("localStorage.getItem('user')"))
-        shadow.lastEvaluatedJavascriptCallback.onReceiveValue(uid?.let { "\"$it\"" } ?: "null")
+        val firstCallback = shadowOf(view).lastEvaluatedJavascriptCallback
+        firstCallback.onReceiveValue(uid?.let { "\"$it\"" } ?: "null")
     }
 
     private fun settleImport(activity: CheckinWebLoginActivity) {
@@ -156,11 +157,14 @@ class CheckinWebLoginActivityTest {
         val view = ready(activity)
         CookieManager.getInstance().setCookie(domain, "session=new-fixture")
         evaluateUid(view, "42")
+        val firstCallback = shadowOf(view).lastEvaluatedJavascriptCallback
         settleImport(activity)
         assertEquals(1, provider.calls.get())
         assertFalse(activity.isFinishing)
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(5))
-        shadowOf(view).lastEvaluatedJavascriptCallback.onReceiveValue("\"42\"")
+        val retried = shadowOf(view).lastEvaluatedJavascriptCallback
+        assertNotSame("必须由真实下一轮JS查询重试，不能反复调用旧回调", firstCallback, retried)
+        retried.onReceiveValue("\"42\"")
         settleImport(activity)
         assertEquals(2, provider.calls.get())
         assertEquals("42", engine.accounts(provider.id).single().uid)
