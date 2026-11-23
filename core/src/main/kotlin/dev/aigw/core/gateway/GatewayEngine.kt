@@ -1480,13 +1480,14 @@ class GatewayEngine(
     }
 
     /** 粘贴 JSON 凭证导入（各供应商自行解析）。 */
-    fun importAccountJson(providerId: String, raw: String): LoginOutcome {
+    fun importAccountJson(providerId: String, raw: String, commitGate: AccountImportGate? = null): LoginOutcome {
         val provider = registry.get(providerId)
             ?: return LoginOutcome(LoginState.FAILED, error = "未知供应商")
+        if (commitGate?.isOpen() == false) return LoginOutcome(LoginState.FAILED, error = "登录已取消")
         return try {
             val account = provider.importCredentials(raw)
                 ?: return LoginOutcome(LoginState.FAILED, error = "该供应商不支持粘贴导入")
-            adopt(providerId, account, "导入")
+            adopt(providerId, account, "导入", commitGate)
         } catch (e: Exception) {
             logWarn("导入失败（$providerId）：${e.message}")
             LoginOutcome(LoginState.FAILED, error = e.message ?: "导入失败")
@@ -1499,8 +1500,14 @@ class GatewayEngine(
         return adopt(providerId, ProviderAccount(providerId, uid, nickname, secret), "添加")
     }
 
-    private fun adopt(providerId: String, account: ProviderAccount, verb: String): LoginOutcome {
-        pool.upsert(account)
+    private fun adopt(
+        providerId: String, account: ProviderAccount, verb: String, commitGate: AccountImportGate? = null,
+    ): LoginOutcome {
+        if (commitGate == null) {
+            pool.upsert(account)
+        } else if (!commitGate.commit { pool.upsert(account) }) {
+            return LoginOutcome(LoginState.FAILED, error = "登录已取消")
+        }
         refreshCredits(providerId, account.uid)
         log("$verb 成功：${account.nickname.ifEmpty { account.uid }}（$providerId）")
         onAccountsChanged?.invoke()

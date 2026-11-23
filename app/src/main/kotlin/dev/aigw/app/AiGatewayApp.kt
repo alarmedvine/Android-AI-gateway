@@ -59,6 +59,8 @@ class AiGatewayApp : Application() {
             },
         )
         engine = created
+        // 签到站点（`checkin:` 前缀）与聊天供应商分开注册：上游新增聊天供应商时不碰这里。
+        dev.aigw.core.gateway.registerCheckinSites(created.registry)
         getSystemService<NotificationManager>()?.apply {
             createNotificationChannel(
                 NotificationChannel(

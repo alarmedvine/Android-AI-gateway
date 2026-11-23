@@ -40,6 +40,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".CheckinWebLoginActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
+
         <service
             android:name=".service.GatewayService"
             android:exported="false"

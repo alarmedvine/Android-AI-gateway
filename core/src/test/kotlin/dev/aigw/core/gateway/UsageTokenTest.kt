@@ -137,6 +137,25 @@ class UsageTokenTest {
     }
 
     @Test
+    fun `美元与未知单位余额不参与API积分汇总且保留明细`() {
+        withServer(
+            CreditProvider("credits", CreditInfo(balance = 900, known = true)),
+            CreditProvider("usd", CreditInfo(balance = 1_250_000, known = true, unit = "usd_quota:500000", detail = "余额 $2.50")),
+            CreditProvider("future", CreditInfo(balance = 500, known = true, unit = "future-unit")),
+        ) { port ->
+            val data = dataOf(get(port, "/api/usage/token"))
+            assertEquals(900, data.get("total_available")?.asLong)
+            val usd = data.get("providers").asJsonArray.map { it.asJsonObject }
+                .first { it.stringOrNull("id") == "usd" }
+            assertEquals(0, usd.get("totalCredits")?.asLong)
+            val account = usd.get("accounts").asJsonArray.first().asJsonObject
+            assertEquals(1_250_000, account.get("credits")?.asLong)
+            assertEquals("usd_quota:500000", account.stringOrNull("unit"))
+            assertEquals("余额 $2.50", account.stringOrNull("detail"))
+        }
+    }
+
+    @Test
     fun `关闭无 Key 后缺 Key 被拒`() {
         val engine = GatewayEngine(InMemoryKeyValueStore())
         engine.updateSettings(engine.settings().copy(apiKey = "secret", allowNoKey = false))

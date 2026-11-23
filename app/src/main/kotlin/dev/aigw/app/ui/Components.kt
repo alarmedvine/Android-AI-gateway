@@ -76,7 +76,8 @@ fun accountStatusText(account: AccountStatus): String = when {
 fun accountCreditsText(account: AccountStatus): String = when {
     !account.creditsKnown -> "—"
     account.creditUnit == CreditUnit.PERCENT -> "${account.credits}%"
-    else -> formatCount(account.credits)
+    else -> CreditUnit.formatUsdQuota(account.credits, account.creditUnit)
+        ?: if (CreditUnit.isCredits(account.creditUnit)) formatCount(account.credits) else "${account.credits} ${account.creditUnit}"
 }
 
 /** 编辑式页头：左侧大标题 + 副标题 + 金色短下划线，右侧动作；[leading]（二级页返回）在标题行左侧。 */

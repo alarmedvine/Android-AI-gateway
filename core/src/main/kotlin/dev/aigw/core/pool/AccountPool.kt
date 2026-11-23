@@ -309,7 +309,9 @@ class AccountPool(
         upsert(newAccount)
         if (before != null) {
             if (!before.enabled) setEnabled(providerId, newAccount.uid, false, before.reason)
-            if (before.creditsKnown) updateCredits(providerId, newAccount.uid, before.credits, true, before.detail)
+            if (before.creditsKnown) updateCredits(
+                providerId, newAccount.uid, before.credits, true, before.detail, before.creditUnit,
+            )
         }
         remove(providerId, oldUid)
         return true
@@ -426,7 +428,7 @@ class AccountPool(
                 // 百分比余额与积分类不是同一个量纲，混进合计就是报假余额
                 if (entry.creditUnit == CreditUnit.PERCENT) {
                     percentKnown++
-                } else {
+                } else if (CreditUnit.isCredits(entry.creditUnit)) {
                     totalCredits += entry.credits
                     creditsKnown++
                 }
