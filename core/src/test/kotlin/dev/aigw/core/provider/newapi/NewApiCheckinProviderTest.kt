@@ -14,6 +14,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -45,11 +46,15 @@ class NewApiCheckinProviderTest {
         server.stop(0)
     }
 
-    private fun profile(signInPath: String = "") = NewApiSiteProfile(
+    private fun profile(
+        signInPath: String = "",
+        mode: CheckinMode = CheckinMode.API,
+    ) = NewApiSiteProfile(
         key = "test",
         name = "Test Site",
         domain = "http://127.0.0.1:$port",
         signInPath = signInPath,
+        checkinMode = mode,
     )
 
     private fun respond(path: String, status: Int, body: String, capture: Boolean = true) {
@@ -146,13 +151,24 @@ class NewApiCheckinProviderTest {
     // ------------------------------------------------------------------ 签到
 
     @Test
-    fun `无签到接口的站点靠查询用户信息完成签到`() {
+    fun `无签到接口的站点不能靠查询用户信息冒充签到`() {
+        // 这条曾经断言「查一次 /api/user/self 就算签到成功」，那是错的：
+        // AgentRouter 的额度只在一次新的 OAuth 登录里发放，查余额永远不加额度。
+        // 现在这种配置必须明确失败，并指向真正的签到入口。
         respond("/api/user/self", 200, selfOk(quota = 30_000_000))
-        val provider = NewApiCheckinProvider(profile(signInPath = ""))
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
         val result = provider.performAction(account(), ACTION_CHECKIN, com.google.gson.JsonObject())
-        assertTrue(result.ok, result.message)
-        assertTrue(result.message.contains("$60.00"), result.message)
-        assertEquals("GET", lastMethod)
+        assertFalse(result.ok, result.message)
+        assertTrue(result.message.contains("重新登录"), result.message)
+        // 关键：不能再悄悄打 /api/user/self 然后报成功
+        assertTrue(lastMethod.isNullOrEmpty(), "不该发出任何请求，实际 $lastMethod")
+    }
+
+    @Test
+    fun `OAuth 站点的签到方式对外可见`() {
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        assertEquals(CheckinMode.OAUTH_RELOGIN, provider.checkinMode())
+        assertEquals("http://127.0.0.1:$port", provider.siteProfile().domain)
     }
 
     @Test

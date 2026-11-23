@@ -7,9 +7,21 @@ package dev.aigw.core.provider.newapi
  * 域名、签到接口路径、用户信息路径、用户标识头名、以及「1 美元等于多少 quota」。
  * 因此新增一个站点不需要写代码，只要加一条 [NewApiSiteProfile]。
  *
- * [signInPath] 为空是合法且有意义的：AgentRouter 这类站点没有独立签到接口，
- * **查询一次 `/api/user/self` 上游就自动完成签到**（对照 anyrouter-check-in 的
- * `utils/config.py:101` —— `sign_in_path = None  # 无需签到接口，查询用户信息时自动完成签到`）。
+ * ## 签到方式（[checkinMode]）
+ *
+ * 这类站点的签到协议**并不统一**，必须由配置显式声明，不能靠猜：
+ *
+ * - [CheckinMode.API]：站点有独立签到接口（AnyRouter 的 `/api/user/sign_in`），POST 一次即可。
+ * - [CheckinMode.OAUTH_RELOGIN]：**没有签到接口**，额度只在「一次新的登录」里发放
+ *   （AgentRouter）。实测 `POST /api/user/sign_in`、`/api/user/checkin` 全部 404，
+ *   上游 `controller.GetSelf` 只读数据库。要签到只能重新走一遍 GitHub OAuth。
+ * - [CheckinMode.NONE]：站点不支持签到。
+ *
+ * **曾经的错误假设**：早期版本认为 AgentRouter「查询一次 `/api/user/self` 上游就自动签到」，
+ * 依据是 anyrouter-check-in 的 `sign_in_path = None` 注释。这条对 AnyRouter 成立、
+ * 对 AgentRouter **不成立**——它导致签到永远回执成功而额度一分不涨。
+ * 社区五个独立实现（ddgksf2013、Code-kike、青龙、jiang7f、agentrouter-magpie）
+ * 都确认 AgentRouter 的额度只在登录/注册/OAuth 回调时发放。
  */
 data class NewApiSiteProfile(
     /** 稳定短名，作为 provider id 的后缀（`checkin:<key>`）。 */
@@ -18,8 +30,10 @@ data class NewApiSiteProfile(
     val name: String,
     /** 站点根地址，不带尾斜杠。 */
     val domain: String,
-    /** 签到接口路径；空串表示「查询用户信息即自动签到」。 */
+    /** 签到接口路径；[checkinMode] 为 [CheckinMode.API] 时才使用。 */
     val signInPath: String = "/api/user/sign_in",
+    /** 签到方式。默认按「有独立签到接口」处理，OAuth 站点必须显式覆盖。 */
+    val checkinMode: CheckinMode = CheckinMode.API,
     /** 当前用户信息接口（余额、用户 id 都从这里拿）。 */
     val userSelfPath: String = "/api/user/self",
     /**
@@ -41,8 +55,7 @@ data class NewApiSiteProfile(
     ),
     /** 是否随 APK 内置（用户自建站点为 false）。 */
     val builtin: Boolean = false,
-) {
-    /** 在账号池里的 provider id。 */
+) {    /** 在账号池里的 provider id。 */
     val providerId: String get() = "$PREFIX$key"
 
     /** 上游主机名（代理设置按它匹配；解析失败返回空串表示「不参与代理判定」）。 */
@@ -64,11 +77,34 @@ data class NewApiSiteProfile(
             key = "agentrouter",
             name = "AgentRouter",
             domain = "https://agentrouter.org",
-            // 查询用户信息即自动签到（见类注释）。
+            // 没有签到接口：额度只在一次新的 GitHub OAuth 登录里发放。
             signInPath = "",
+            checkinMode = CheckinMode.OAUTH_RELOGIN,
             builtin = true,
         )
 
         val builtins: List<NewApiSiteProfile> = listOf(AGENTROUTER)
     }
+}
+
+/**
+ * 一个站点的签到方式。
+ *
+ * 这是**必须显式声明**的配置，因为「没有签到接口」和「查询用户信息会自动签到」
+ * 在 HTTP 层看不出区别——两者都只是几个 2xx/4xx。猜错的代价是签到永远假成功。
+ */
+enum class CheckinMode {
+    /** 有独立签到接口，`POST {domain}{signInPath}`。 */
+    API,
+
+    /**
+     * 没有签到接口；额度在「一次新的登录」里发放，必须重新走一遍 OAuth。
+     *
+     * 真正的成功判据不在登录响应里（`checked_in` 对当天已签过的账号同样为 true），
+     * 而是站点日志里出现本次窗口内的签到记录，见 [CheckinLogClient]。
+     */
+    OAUTH_RELOGIN,
+
+    /** 站点不支持签到。 */
+    NONE,
 }

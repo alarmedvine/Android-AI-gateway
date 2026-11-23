@@ -114,11 +114,23 @@ class NewApiCheckinProvider(
     private fun checkin(account: ProviderAccount): ProviderActionResult {
         val credential = parse(account) ?: return ProviderActionResult.failure("凭证无法解析")
         return try {
+            when (profile.checkinMode) {
+                CheckinMode.NONE -> return ProviderActionResult.failure("「${profile.name}」不支持签到")
+
+                // 没有签到接口：额度只在一次新的 OAuth 登录里发放。这里**不能**用
+                // 「查一次 /api/user/self」冒充签到 —— 那条路永远不加额度，却会回执成功，
+                // 上一版正是这样让用户以为签到成功、实际额度一分没动。
+                // 真正的签到由 CheckinOauthLoginActivity 重走一遍 GitHub 授权完成，
+                // 判据见 CheckinLogClient（站点日志里的签到记录）。
+                CheckinMode.OAUTH_RELOGIN -> return ProviderActionResult.failure(
+                    "「${profile.name}」的签到就是重新登录一次 GitHub：请点「重新授权签到」。" +
+                        "该站点没有签到接口，只查余额不会增加额度。",
+                )
+
+                CheckinMode.API -> Unit
+            }
             if (profile.signInPath.isEmpty()) {
-                // 查询成功只确认有效账号与合法额度；不把 HTML/WAF/未知响应当成签到回执。
-                val data = fetchSelf(credential, account.uid)
-                val quota = quotaValue(data, "quota", required = true)
-                return ProviderActionResult.success("已完成站点自动签到查询，当前余额 ${dollars(quota)}")
+                return ProviderActionResult.failure("「${profile.name}」缺少签到接口配置")
             }
 
             val headers = mapOf(
@@ -142,6 +154,26 @@ class NewApiCheckinProvider(
         } catch (e: Exception) {
             ProviderActionResult.failure(e.message ?: "签到失败")
         }
+    }
+
+    // ------------------------------------------------------------------ 签到方式（供 UI 分派）
+
+    /** 该站点怎么签到。UI 据此决定显示「立即签到」还是「重新授权签到」。 */
+    fun checkinMode(): CheckinMode = profile.checkinMode
+
+    /** 站点配置（UI 需要 domain / 展示名来拉起授权页）。 */
+    fun siteProfile(): NewApiSiteProfile = profile
+
+    /**
+     * 用站点日志核验本次签到是否真的落库。
+     *
+     * 只有它能回答「额度到底加了没有」：登录响应里的 checked_in 对当天已签过的账号
+     * 同样是 true，不能作为本次成功的证据。
+     */
+    fun verifyCheckin(account: ProviderAccount, runStartMs: Long): CheckinLogClient.Result {
+        val credential = parse(account)
+            ?: return CheckinLogClient.Result(CheckinLogClient.Outcome.ERROR, "凭证无法解析")
+        return CheckinLogClient(profile).verify(credential.cookies, account.uid, runStartMs)
     }
 
     // ------------------------------------------------------------------ 凭证
