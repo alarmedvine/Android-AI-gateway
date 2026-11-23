@@ -28,10 +28,15 @@ object ProviderUiRegistry {
 
     private val customCache = ConcurrentHashMap<String, ProviderUi>()
 
+    /** 签到站点也是动态的：每个 `checkin:<key>` 一个实例（与 [customCache] 同理）。 */
+    private val checkinCache = ConcurrentHashMap<String, ProviderUi>()
+
     fun of(providerId: String): ProviderUi? = when {
         builtin.containsKey(providerId) -> builtin[providerId]
         // 每个自定义供应商一个实例：组件需要知道自己绑定的 providerId，缓存实例避免重复创建导致 Compose 无法跳过重组
         providerId.startsWith(CUSTOM_PREFIX) -> customCache.computeIfAbsent(providerId) { CustomUi(it) }
+        providerId.startsWith(CHECKIN_PREFIX) ->
+            checkinCache.computeIfAbsent(providerId) { dev.aigw.app.ui.providers.checkinsite.CheckinSiteUi(it) }
         else -> null
     }
 
@@ -39,4 +44,7 @@ object ProviderUiRegistry {
         of(providerId) ?: error("没有为供应商 $providerId 注册 UI 组件")
 
     const val CUSTOM_PREFIX = "custom:"
+
+    /** 签到站点前缀（见 `NewApiSiteProfile.PREFIX`）。 */
+    const val CHECKIN_PREFIX = "checkin:"
 }
