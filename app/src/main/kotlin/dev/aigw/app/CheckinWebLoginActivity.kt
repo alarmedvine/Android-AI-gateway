@@ -127,8 +127,8 @@ class CheckinWebLoginActivity : ComponentActivity() {
         // WebStorage 的删除没有回调：随后用同源空文档显式清 localStorage/sessionStorage，
         // evaluateJavascript 确认成功后才发起真实登录页，避免异步删除留下旧 user.id。
         WebStorage.getInstance().deleteAllData()
-        CookieManager.getInstance().removeAllCookies {
-            if (closed) return@removeAllCookies
+        run {
+            if (closed) return@run
             CookieManager.getInstance().flush()
             resettingStorage = true
             web.loadDataWithBaseURL(target.domain + "/", "<html><body></body></html>", "text/html", "UTF-8", null)
