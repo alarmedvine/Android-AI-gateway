@@ -220,7 +220,7 @@ class CheckinWebLoginActivity : ComponentActivity() {
 
     private fun schedulePoll() {
         handler.removeCallbacks(pollCookies)
-        if (!closed && ready) handler.postDelayed(pollCookies, COOKIE_POLL_MS)
+        if (!closed && ready && attempts == 0) handler.postDelayed(pollCookies, COOKIE_POLL_MS)
     }
 
     private fun tryComplete() {
