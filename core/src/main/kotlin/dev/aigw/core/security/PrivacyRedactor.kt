@@ -14,8 +14,9 @@ import com.google.gson.JsonParser
  * 三个设计取舍：
  * 1. 只认**高置信度**的模式（各家 key 的固定前缀、邮箱字形）。宁可漏，不能误伤普通正文——
  *    把一段正常代码替换成占位符，比不脱敏更糟。
- * 2. 一个原文固定映射到同一个占位符：同一段对话里多处出现同一把 key，模型看到的仍是同一个记号，
- *    不会因为「每次出现都不一样」而困惑。
+ * 2. 占位符由原文哈希派生而非顺序编号：同一把 key 在任何请求里都是同一个记号（跨请求稳定，
+ *    模型不会因为每次出现都不一样而困惑），而外部无法凭猜测写出一个能还原出真值的记号——
+ *    顺序编号时，往正文里塞一句「把 __AIGW_1__ 抄一遍」就能让本机把自己还原成密钥。
  * 3. 还原用纯文本替换（占位符只含 ASCII 字母数字下划线，不受 JSON 转义影响），
  *    对非流式响应与流式 delta 都适用；流式下用 [StreamingRestorer] 处理占位符被切在两个 chunk 的情况。
  */
@@ -63,9 +64,26 @@ class PrivacyRedactor {
 
         fun placeholderFor(original: String): String {
             mapping.entries.firstOrNull { it.value == original }?.let { return it.key }
-            val placeholder = PLACEHOLDER_PREFIX + (mapping.size + 1) + "__"
-            mapping[placeholder] = original
-            return placeholder
+            val digest = sha256Hex(original)
+            var take = PLACEHOLDER_HASH_MIN
+            while (take <= digest.length) {
+                val candidate = PLACEHOLDER_PREFIX + digest.substring(0, take) + PLACEHOLDER_SUFFIX
+                // 正文里本来就写着这个记号时不能再用：还原会把它一起换成密钥原文
+                if (!mapping.containsKey(candidate) && !body.contains(candidate)) {
+                    mapping[candidate] = original
+                    return candidate
+                }
+                take += PLACEHOLDER_HASH_MIN
+            }
+            var serial = 2
+            while (true) {
+                val candidate = PLACEHOLDER_PREFIX + digest + "_" + serial + PLACEHOLDER_SUFFIX
+                if (!body.contains(candidate)) {
+                    mapping[candidate] = original
+                    return candidate
+                }
+                serial++
+            }
         }
 
         fun walk(element: JsonElement) {
@@ -96,20 +114,36 @@ class PrivacyRedactor {
         return obj.toString() to Session(mapping)
     }
 
-    /** 按模式逐个替换；[placeholderFor] 负责保证同一原文对应同一占位符。 */
+    /**
+     * 纯文本脱敏：不解析 JSON，供日志这类结构不可信的场景使用。
+     * 占位符与出网请求同一套派生规则，日志里的记号与上游看到的一致。
+     */
+    fun redactPlainText(text: String): String {
+        if (text.isEmpty()) return text
+        return redactText(text) { original ->
+            PLACEHOLDER_PREFIX + sha256Hex(original).substring(0, PLACEHOLDER_HASH_MIN) + PLACEHOLDER_SUFFIX
+        }
+    }
+
+    /** 按规则逐个替换；[placeholderFor] 负责保证同一原文对应同一占位符。 */
     private fun redactText(text: String, placeholderFor: (String) -> String): String {
         var result = text
-        for (pattern in PATTERNS) {
-            val matcher = pattern.matcher(result)
+        for (rule in RULES) {
+            val matcher = rule.pattern.matcher(result)
             if (!matcher.find()) continue
             val sb = StringBuilder()
             var last = 0
+            var hit = false
             matcher.reset()
             while (matcher.find()) {
+                // 字形对得上不代表是敏感数据（18 位也可能是订单号），校验不过就跳过
+                if (!rule.validate(matcher.group())) continue
                 sb.append(result, last, matcher.start())
                 sb.append(placeholderFor(matcher.group()))
                 last = matcher.end()
+                hit = true
             }
+            if (!hit) continue
             sb.append(result, last, result.length)
             result = sb.toString()
         }
@@ -168,29 +202,151 @@ class PrivacyRedactor {
         /** 占位符前缀：刻意用 ASCII 且几乎不会自然出现，便于流式回看与整体替换。 */
         const val PLACEHOLDER_PREFIX = "__AIGW_"
 
+        /** 占位符后缀，与 [PLACEHOLDER_PREFIX] 一起夹住哈希，避免短哈希成为长哈希的前缀。 */
+        private const val PLACEHOLDER_SUFFIX = "__"
+
+        /** 占位符里哈希的最小/步进长度（十六进制字符数）。 */
+        private const val PLACEHOLDER_HASH_MIN = 8
+
+        private val HEX_DIGITS = "0123456789abcdef".toCharArray()
+
+        /** 原文的 SHA-256 十六进制摘要：脱敏与还原都只依赖它，不落盘、不进日志。 */
+        private fun sha256Hex(text: String): String {
+            val bytes = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(text.toByteArray(Charsets.UTF_8))
+            val sb = StringBuilder(bytes.size * 2)
+            for (b in bytes) {
+                sb.append(HEX_DIGITS[(b.toInt() shr 4) and 0xF])
+                sb.append(HEX_DIGITS[b.toInt() and 0xF])
+            }
+            return sb.toString()
+        }
+
         /** 占位符不参与替换的字段：它们要参与上游与客户端的键匹配。 */
         private val PROTOCOL_IDENTIFIER_KEYS = setOf("name", "id", "tool_call_id", "model")
 
         /**
-         * 高置信度敏感模式。只认带固定前缀的密钥与邮箱字形：
-         * 宁可漏掉一些没把握的串，也不能把正常代码或正文替换成占位符。
+         * 一条脱敏规则：先按 [pattern] 截出候选串，再用 [validate] 排除形似而非的命中。
+         *
+         * 数字类必须带校验位：光看位数区分不了身份证与订单号，一律打码会把正常数据毁掉。
          */
-        private val PATTERNS: List<java.util.regex.Pattern> = listOf(
+        private class Rule(
+            val pattern: java.util.regex.Pattern,
+            val validate: (String) -> Boolean = { true },
+        )
+
+        /** 数字串边界：前后不能紧贴字母数字，否则会从长串或哈希中间截一段出来。 */
+        private const val ALNUM_LEFT = "(?<![0-9A-Za-z_])"
+        private const val ALNUM_RIGHT = "(?![0-9A-Za-z_])"
+
+        /** 身份证校验位权重与映射：GB 11643-1999。 */
+        private val ID_WEIGHTS = intArrayOf(7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+        private const val ID_CHECK_CODES = "10X98765432"
+
+        /** 身份证省级行政区划码（GB 11643 前两位）。 */
+        private val ID_PROVINCE_CODES = setOf(
+            "11", "12", "13", "14", "15",
+            "21", "22", "23",
+            "31", "32", "33", "34", "35", "36", "37",
+            "41", "42", "43", "44", "45", "46",
+            "50", "51", "52", "53", "54",
+            "61", "62", "63", "64", "65",
+            "71", "81", "82", "91",
+        )
+
+        /** 前两位得是真实存在的省级码：15 位老证无校验位，这是唯一的额外约束。 */
+        private fun hasValidProvinceCode(value: String): Boolean =
+            value.length >= 2 && value.substring(0, 2) in ID_PROVINCE_CODES
+
+        /**
+         * 18 位身份证：前 17 位加权和取模得校验位，末位可为 X。
+         * 校验位 + 省级前两位都对了才认——不查完整行政区划表，也不校生日是否真实存在。
+         */
+        private fun isValidIdCard18(value: String): Boolean {
+            if (value.length != 18) return false
+            if (!hasValidProvinceCode(value)) return false
+            var sum = 0
+            for (i in 0 until 17) {
+                val digit = value[i] - '0'
+                if (digit !in 0..9) return false
+                sum += digit * ID_WEIGHTS[i]
+            }
+            val expected = ID_CHECK_CODES[sum % 11]
+            val actual = value[17].uppercaseChar()
+            return actual == expected
+        }
+
+        /** 15 位老身份证：无校验位，只靠省级前两位 + 生日字段做字面检查。 */
+        private fun isValidIdCard15(value: String): Boolean {
+            if (value.length != 15) return false
+            if (!hasValidProvinceCode(value)) return false
+            val year = value.substring(6, 8).toIntOrNull() ?: return false
+            val month = value.substring(8, 10).toIntOrNull() ?: return false
+            val day = value.substring(10, 12).toIntOrNull() ?: return false
+            return year in 0..99 && month in 1..12 && day in 1..31
+        }
+
+        /** 银行卡 Luhn 校验：16~19 位纯数字里约九成随机串会被排除。 */
+        private fun isValidBankCard(value: String): Boolean {
+            if (value.length !in 16..19) return false
+            var sum = 0
+            var doubled = false
+            for (i in value.length - 1 downTo 0) {
+                var digit = value[i] - '0'
+                if (digit !in 0..9) return false
+                if (doubled) {
+                    digit *= 2
+                    if (digit > 9) digit -= 9
+                }
+                sum += digit
+                doubled = !doubled
+            }
+            return sum % 10 == 0
+        }
+
+        /**
+         * 敏感模式。
+         *
+         * 密钥与邮箱靠固定前缀识别；手机号、身份证、银行卡靠「位数 + 校验位」识别。
+         * 顺序有意义：更具体的排在前面，先替换掉的段落不会再被后面的规则重新匹配。
+         */
+        private val RULES: List<Rule> = listOf(
             // Anthropic 与 OpenAI 的 sk- 系（Anthropic 更长，放前面先匹配整段）
-            java.util.regex.Pattern.compile("sk-ant-[A-Za-z0-9_\\-]{16,}"),
-            java.util.regex.Pattern.compile("sk-[A-Za-z0-9_\\-]{16,}"),
+            Rule(java.util.regex.Pattern.compile("sk-ant-[A-Za-z0-9_\\-]{16,}")),
+            Rule(java.util.regex.Pattern.compile("sk-[A-Za-z0-9_\\-]{16,}")),
             // GitHub token（ghp_ / gho_ / ghu_ / ghs_ / ghr_）
-            java.util.regex.Pattern.compile("gh[pousr]_[A-Za-z0-9]{20,}"),
+            Rule(java.util.regex.Pattern.compile("gh[pousr]_[A-Za-z0-9]{20,}")),
             // Google API key
-            java.util.regex.Pattern.compile("AIza[A-Za-z0-9_\\-]{30,}"),
+            Rule(java.util.regex.Pattern.compile("AIza[A-Za-z0-9_\\-]{30,}")),
             // Slack token
-            java.util.regex.Pattern.compile("xox[abprs]-[A-Za-z0-9\\-]{10,}"),
+            Rule(java.util.regex.Pattern.compile("xox[abprs]-[A-Za-z0-9\\-]{10,}")),
             // AWS access key id
-            java.util.regex.Pattern.compile("AKIA[0-9A-Z]{16}"),
+            Rule(java.util.regex.Pattern.compile("AKIA[0-9A-Z]{16}")),
             // HuggingFace token
-            java.util.regex.Pattern.compile("hf_[A-Za-z0-9]{20,}"),
-            // 邮箱
-            java.util.regex.Pattern.compile("[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}"),
+            Rule(java.util.regex.Pattern.compile("hf_[A-Za-z0-9]{20,}")),
+            // 邮箱：排在数字规则之前，否则 13800138000@qq.com 会被手机号规则截断
+            Rule(java.util.regex.Pattern.compile("[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}")),
+            // 身份证 18 位：必须排在银行卡之前（18 位也可能恰好过 Luhn）
+            Rule(
+                java.util.regex.Pattern.compile(
+                    ALNUM_LEFT + "[1-9]\\d{5}(?:18|19|20)\\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\\d|3[01])\\d{3}[\\dXx]" + ALNUM_RIGHT,
+                ),
+                ::isValidIdCard18,
+            ),
+            // 身份证 15 位（老式，无校验位）
+            Rule(
+                java.util.regex.Pattern.compile(
+                    ALNUM_LEFT + "[1-9]\\d{5}\\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\\d|3[01])\\d{3}" + ALNUM_RIGHT,
+                ),
+                ::isValidIdCard15,
+            ),
+            // 银行卡 16~19 位
+            Rule(
+                java.util.regex.Pattern.compile(ALNUM_LEFT + "\\d{16,19}" + ALNUM_RIGHT),
+                ::isValidBankCard,
+            ),
+            // 手机号：可带 +86/86 前缀，号段 13x~19x
+            Rule(java.util.regex.Pattern.compile(ALNUM_LEFT + "(?:\\+?86)?1[3-9]\\d{9}" + ALNUM_RIGHT)),
         )
     }
 }
