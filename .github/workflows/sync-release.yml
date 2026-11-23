@@ -323,3 +323,19 @@ jobs:
           name: v${{ needs.sync.outputs.version }}
           body: ${{ steps.changelog.outputs.body }}
           files: ai-gateway-${{ needs.sync.outputs.version }}-release.apk
+
+      # 同步 job 的成功不等于发出包：构建/测试/上传任何一步红都只体现在 run 列表里，
+      # 2026-11-22 的工具链破坏就是这样静默失败了一整天（直到用户发现版本没更新）。
+      # 这里补一条与同步失败同形的 issue 提醒，失败必须有留痕。
+      - name: 失败时开 issue 提醒（构建/发版）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="自动构建/发版失败（$(date -u +%Y-%m-%d) v${{ needs.sync.outputs.version }}）"
+          if gh issue list --state open --search "in:title 自动构建/发版失败" --json number --jq 'length' | grep -q '^0$'; then
+            gh issue create --title "$TITLE" \
+              --body "同步已合并，但构建或发版失败（v${{ needs.sync.outputs.version }} 未发布），请查看运行日志：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+          else
+            echo "已有未关闭的构建失败 issue，跳过创建"
+          fi
