@@ -204,7 +204,7 @@ class CheckinWebLoginActivity : ComponentActivity() {
         handler.removeCallbacksAndMessages(null)
         webView?.apply {
             stopLoading()
-            webViewClient = null
+            webViewClient = WebViewClient()
             webChromeClient = null
             loadUrl("about:blank")
             destroy()
