@@ -24,6 +24,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.android.controller.ActivityController
 import org.robolectric.annotation.Config
@@ -88,7 +89,7 @@ class CheckinWebLoginActivityTest {
     }
 
     private fun start(): ActivityController<CheckinWebLoginActivity> {
-        val app = Robolectric.buildApplication(Application::class.java).create().get()
+        val app = RuntimeEnvironment.getApplication()
         val intent = CheckinWebLoginActivity.intent(app, provider.id, "$domain/login", "agentrouter.org")
         val controller = Robolectric.buildActivity(CheckinWebLoginActivity::class.java, intent)
             .create().start().resume().visible()
@@ -220,8 +221,7 @@ class CheckinWebLoginActivityTest {
         val message = Message.obtain(Handler(Looper.getMainLooper()))
         message.obj = transport
         assertTrue(shadowOf(view).webChromeClient.onCreateWindow(view, false, false, message))
-        val popup = transport.webView
-        assertNotNull(popup)
+        val popup = requireNotNull(transport.webView)
         assertTrue(popup.settings.supportMultipleWindows())
         shadowOf(view).webChromeClient.onCloseWindow(popup)
         assertNull(ReflectionHelpers.getField<WebView?>(activity, "popupWebView"))
