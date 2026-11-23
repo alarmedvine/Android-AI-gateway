@@ -1,10 +1,10 @@
 package dev.aigw.core.provider.newapi
 
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
-import org.junit.Test
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * 「签到 = 重新 OAuth 登录」这套判据的回归。
@@ -134,8 +134,8 @@ class CheckinOauthPolicyTest {
     @Test
     fun `日志查询必须带 type 过滤与时间下界`() {
         val path = CheckinLogEvidence.logQueryPath(1_700_000_000L)
-        assertTrue(path, path.contains("type=4"))
-        assertTrue(path, path.contains("start_timestamp=1700000000"))
-        assertTrue(path, path.startsWith("/api/log/self?"))
+        assertTrue(path.contains("type=4"), path)
+        assertTrue(path.contains("start_timestamp=1700000000"), path)
+        assertTrue(path.startsWith("/api/log/self?"), path)
     }
 }
