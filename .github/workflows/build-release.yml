@@ -46,7 +46,17 @@ jobs:
           EOF
 
       - name: 单元测试
-        run: gradle :core:test --console=plain
+        run: gradle :core:test :app:testReleaseUnitTest --console=plain
+
+      - name: 保留单元测试结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-test-results
+          path: |
+            core/build/test-results/test/*.xml
+            app/build/test-results/testReleaseUnitTest/*.xml
+          retention-days: 14
 
       - name: 打包 release
         run: gradle :app:assembleRelease --console=plain

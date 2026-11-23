@@ -3,70 +3,104 @@ package dev.aigw.app
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Message
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
+import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import com.google.gson.JsonObject
+import dev.aigw.core.gateway.AccountImportGate
 import dev.aigw.core.provider.newapi.CheckinCookie
+import dev.aigw.core.provider.newapi.CheckinLoginPolicy
+import dev.aigw.core.provider.newapi.NewApiSiteProfile
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * 应用内网页登录：为「签到站点」拿到会话 cookie。
- *
- * ## 为什么必须是应用内 WebView
- *
- * 签到站点的账号是用 GitHub / LinuxDO 的 OAuth 注册的，New API 给这类用户的是随机密码，
- * 用户并不知道；而 OAuth 授权页必须有人在场。**系统浏览器完成 OAuth 后 cookie 留在浏览器里，
- * 应用读不到**（进程隔离），所以只能让 WebView 自己做完整流程，再从 CookieManager 取。
- *
- * 这与 `ProviderDetailScreen` 里「登录一律交给系统浏览器」的策略并不冲突：那边要的是
- * 回调 URL（本地回环端口接），这边要的是 cookie 本身，两条路径的目标不同。
- *
- * ## 只做登录，不做签到
- *
- * 登录成功后立刻把 cookie 交给 `GatewayEngine.importAccountJson`，随后 finish。
- * 每日签到由 `AutoCheckin` 在后台用这份 cookie 直接打上游，不再经过 WebView。
+ * 临时站点登录，不复用前一次账号的浏览器状态。
+ * CookieManager 是进程共享的，因此一次只允许一个登录；清理回调完成才加载站点。
+ * 登录身份从当前站点页面取得，仍由 provider 的 /self 严格校验，Cookie 本身不是完成信号。
  */
 class CheckinWebLoginActivity : ComponentActivity() {
-
     private var webView: WebView? = null
-    private var finished = false
-    private var importing = false
+    private var popupWebView: WebView? = null
+    private var root: FrameLayout? = null
+    private var profile: NewApiSiteProfile? = null
+    private var closed = false
+    private var ready = false
+    private var resettingStorage = false
+    private var checking = false
+    private var attempts = 0
+    private var nextImportAt = 0L
+    private var startedAt = 0L
+    private val owner = Any()
+    private var ownsSession = false
+    private val commitGate = AccountImportGate()
+    private val executor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "checkin-web-login").apply { isDaemon = true }
+    }
+    private var importFuture: Future<*>? = null
     private val handler = Handler(Looper.getMainLooper())
 
+    /** 只有这一条周期链；导入失败/JS 空结果不消耗掉下一轮。 */
     private val pollCookies = object : Runnable {
         override fun run() {
-            if (finished || importing) return
-            if (tryComplete()) return
-            handler.postDelayed(this, COOKIE_POLL_MS)
+            if (closed || !ready) return
+            if (SystemClock.elapsedRealtime() - startedAt >= LOGIN_TIMEOUT_MS) {
+                notice("登录等待超时，请重新打开登录页")
+                finish()
+                return
+            }
+            if (!checking && SystemClock.elapsedRealtime() >= nextImportAt) tryComplete()
+            if (!closed) schedulePoll()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val providerId = intent.getStringExtra(EXTRA_PROVIDER_ID).orEmpty()
+        val target = NewApiSiteProfile.builtins.firstOrNull { it.providerId == providerId }
         val loginUrl = intent.getStringExtra(EXTRA_LOGIN_URL).orEmpty()
         val siteHost = intent.getStringExtra(EXTRA_SITE_HOST).orEmpty()
-        if (providerId.isEmpty() || loginUrl.isEmpty() || siteHost.isEmpty()) {
-            Toast.makeText(this, "登录参数缺失", Toast.LENGTH_SHORT).show()
+        if (target == null || target.host != siteHost ||
+            !CheckinLoginPolicy.isSitePage(loginUrl, target.domain)) {
+            notice("登录参数无效")
             finish()
             return
         }
+        if (!LOGIN_OWNER.compareAndSet(null, owner)) {
+            notice("已有站点正在登录，请先关闭它")
+            finish()
+            return
+        }
+        ownsSession = true
+        profile = target
+        startedAt = SystemClock.elapsedRealtime()
+        handler.postDelayed({
+            if (!closed) {
+                notice("登录等待超时，请重新打开登录页")
+                finish()
+            }
+        }, LOGIN_TIMEOUT_MS)
 
-        val root = FrameLayout(this)
-        val progress = ProgressBar(this).apply {
-            // 顶部细进度条：页面加载时给一个「在做事」的反馈
+        val frame = FrameLayout(this)
+        root = frame
+        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 (3 * resources.displayMetrics.density).toInt(),
@@ -74,148 +108,234 @@ class CheckinWebLoginActivity : ComponentActivity() {
         }
         val web = WebView(this)
         webView = web
-        root.addView(
-            web,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-        root.addView(progress)
-        setContentView(root)
+        web.isEnabled = false
+        frame.addView(web, fullScreenParams())
+        frame.addView(progress)
+        setContentView(frame)
+        configure(web, progress)
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val popup = popupWebView
+                if (popup != null) {
+                    if (popup.canGoBack()) popup.goBack() else finish()
+                } else if (web.canGoBack() && web.copyBackForwardList().currentIndex > 1) {
+                    web.goBack()
+                } else finish()
+            }
+        })
 
-        configure(web)
-        web.webChromeClient = object : android.webkit.WebChromeClient() {
+        // WebStorage 的删除没有回调：随后用同源空文档显式清 localStorage/sessionStorage，
+        // evaluateJavascript 确认成功后才发起真实登录页，避免异步删除留下旧 user.id。
+        WebStorage.getInstance().deleteAllData()
+        CookieManager.getInstance().removeAllCookies {
+            if (closed) return@removeAllCookies
+            CookieManager.getInstance().flush()
+            resettingStorage = true
+            web.loadDataWithBaseURL(target.domain + "/", "<html><body></body></html>", "text/html", "UTF-8", null)
+        }
+    }
+
+    private fun fullScreenParams() = FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT,
+    )
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun configure(web: WebView, progress: ProgressBar) {
+        web.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            cacheMode = WebSettings.LOAD_NO_CACHE
+            useWideViewPort = true
+            loadWithOverviewMode = false
+            setSupportZoom(false)
+            builtInZoomControls = false
+            displayZoomControls = false
+            textZoom = 100
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            allowFileAccess = false
+            allowContentAccess = false
+            // AgentRouter GitHub OAuth 的实际入口用异步 window.open，不能漏掉 popup 边。
+            setSupportMultipleWindows(true)
+            javaScriptCanOpenWindowsAutomatically = true
+        }
+        web.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+        web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 progress.progress = newProgress
                 progress.visibility = if (newProgress >= 100) View.GONE else View.VISIBLE
             }
+
+            override fun onCreateWindow(
+                view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?,
+            ): Boolean {
+                val target = profile ?: return false
+                if (closed || !ready || popupWebView != null ||
+                    !CheckinLoginPolicy.isSitePage(view?.url, target.domain)) return false
+                val message = resultMsg ?: return false
+                val transport = message.obj as? WebView.WebViewTransport ?: return false
+                val popup = WebView(this@CheckinWebLoginActivity)
+                configure(popup, progress)
+                popupWebView = popup
+                root?.addView(popup, fullScreenParams())
+                progress.bringToFront()
+                transport.webView = popup
+                message.sendToTarget()
+                return true
+            }
+
+            override fun onCloseWindow(window: WebView?) {
+                if (window === popupWebView) closePopup(window)
+            }
         }
         web.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                // 首页/控制台一出现就试一次：session 通常在这时已经写进 CookieManager
-                if (url != null && isTargetPage(url, siteHost)) handler.post { tryComplete() }
-            }
-
             override fun onPageFinished(view: WebView?, url: String?) {
-                if (url != null && isTargetPage(url, siteHost)) handler.post { tryComplete() }
+                if (closed) return
+                val target = profile ?: return
+                val current = view ?: return
+                if (resettingStorage && current === webView) {
+                    resettingStorage = false
+                    current.evaluateJavascript(STORAGE_RESET_JS) { result ->
+                        if (closed) return@evaluateJavascript
+                        if (result != "\"cleared\"") {
+                            notice("无法清理旧登录状态，请关闭后重试")
+                            finish()
+                            return@evaluateJavascript
+                        }
+                        ready = true
+                        current.isEnabled = true
+                        current.loadUrl(target.domain.trimEnd('/') + "/login")
+                        schedulePoll()
+                    }
+                } else if (CheckinLoginPolicy.canReadIdentity(url, target.domain)) {
+                    schedulePoll()
+                }
             }
 
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest): Boolean {
-                // 自定义 scheme（如某些 OAuth 中转）直接放弃，避免 WebView 白屏卡住
-                val url = request.url?.toString().orEmpty()
-                return url.startsWith("intent:") || url.startsWith("market:")
-            }
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest): Boolean =
+                !request.url.scheme.equals("https", ignoreCase = true)
         }
-        web.loadUrl(loginUrl)
-        handler.postDelayed(pollCookies, COOKIE_POLL_MS)
     }
 
-    private fun configure(web: WebView) {
-        @SuppressLint("SetJavaScriptEnabled")
-        val settings = web.settings
-        settings.javaScriptEnabled = true
-        settings.domStorageEnabled = true
-        settings.databaseEnabled = true
-        settings.cacheMode = WebSettings.LOAD_DEFAULT
-        // 渲染修复：作者废弃内嵌 WebView 的三个症状（整页缩放错乱 / 输入框文字镜像）
-        // 分别来自「概览模式缩放」「RTL 布局继承」「文本缩放不为 100」。
-        settings.useWideViewPort = true
-        settings.loadWithOverviewMode = false
-        settings.setSupportZoom(false)
-        settings.builtInZoomControls = false
-        settings.displayZoomControls = false
-        settings.textZoom = 100
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-        web.layoutDirection = View.LAYOUT_DIRECTION_LTR
-        web.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+    private fun schedulePoll() {
+        handler.removeCallbacks(pollCookies)
+        if (!closed && ready) handler.postDelayed(pollCookies, COOKIE_POLL_MS)
     }
 
-    /** 只有回到站点自己的页面（不是 OAuth 中间页）才认为流程走完。 */
-    private fun isTargetPage(url: String, siteHost: String): Boolean {
-        val lower = url.lowercase()
-        if (!lower.contains(siteHost)) return false
-        return !lower.contains("/oauth/") && !lower.contains("/api/oauth/")
-    }
-
-    /**
-     * 读 cookie 并尝试导入账号。
-     *
-     * 导入本身要打一次上游（校验 cookie 并拿 uid），所以放到后台线程；
-     * 期间用 [importing] 挡住轮询重入。返回 true 表示「已经发起一次导入」，
-     * 调用方据此停止本轮轮询（下一轮由导入结束后的状态决定）。
-     */
-    private fun tryComplete(): Boolean {
-        if (finished || importing) return false
-        val providerId = intent.getStringExtra(EXTRA_PROVIDER_ID).orEmpty()
-        val siteHost = intent.getStringExtra(EXTRA_SITE_HOST).orEmpty()
-        val cookieText = CookieManager.getInstance().getCookie("https://$siteHost").orEmpty()
-        val cookies = CheckinCookie.parse(cookieText)
-        if (!cookies.containsKey("session")) return false
-
-        importing = true
-        val raw = JsonObject().apply {
-            addProperty("cookies", CheckinCookie.format(cookies))
-        }.toString()
-        Thread({
-            val engine = (application as AiGatewayApp).engine
-            val outcome = runCatching { engine?.importAccountJson(providerId, raw) }
-            handler.post {
-                importing = false
-                val result = outcome.getOrNull()
-                when {
-                    result == null -> {
-                        Toast.makeText(this, "网关尚未初始化", Toast.LENGTH_LONG).show()
-                        finish()
-                    }
-                    result.ok -> {
-                        Toast.makeText(
-                            this,
-                            "已添加：${result.nickname.ifEmpty { result.uid }}",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                        finished = true
-                        setResult(RESULT_OK)
-                        finish()
-                    }
-                    else -> {
-                        // cookie 拿到了但上游不认（多半是授权还没真正完成），继续等下一轮
-                        Log.w(TAG, "导入失败，继续等待：${result.error}")
+    private fun tryComplete() {
+        val target = profile ?: return
+        val web = popupWebView ?: webView ?: return
+        if (closed || !ready || checking || !CheckinLoginPolicy.canReadIdentity(web.url, target.domain)) return
+        checking = true
+        web.evaluateJavascript(PAGE_UID_JS) { value ->
+            if (closed) return@evaluateJavascript
+            val uid = CheckinLoginPolicy.pageUserId(value)
+            val stillSite = CheckinLoginPolicy.canReadIdentity(web.url, target.domain)
+            val cookies = CheckinCookie.parse(CookieManager.getInstance().getCookie(target.domain).orEmpty())
+            if (!stillSite || uid == null || !cookies.containsKey("session")) {
+                checking = false
+                return@evaluateJavascript
+            }
+            val raw = JsonObject().apply {
+                addProperty("cookies", CheckinCookie.format(cookies))
+                addProperty("apiUserId", uid)
+            }.toString()
+            attempts++
+            importFuture = executor.submit {
+                val result = runCatching {
+                    (application as? AiGatewayApp)?.engine?.importAccountJson(target.providerId, raw, commitGate)
+                }.getOrNull()
+                handler.post {
+                    if (closed) return@post
+                    checking = false
+                    importFuture = null
+                    when {
+                        result == null -> {
+                            notice("网关尚未初始化")
+                            finish()
+                        }
+                        result.ok -> {
+                            notice("已添加：${result.nickname.ifEmpty { result.uid }}")
+                            setResult(RESULT_OK)
+                            finish()
+                        }
+                        attempts >= MAX_IMPORT_ATTEMPTS -> {
+                            notice("登录校验失败，请重试：${result.error}")
+                            finish()
+                        }
+                        else -> {
+                            nextImportAt = SystemClock.elapsedRealtime() + IMPORT_RETRY_MS
+                            Log.w(TAG, "登录校验未成功，将重试：${result.error}")
+                            if (attempts == 1) notice("登录校验未成功，正在重试")
+                            schedulePoll()
+                        }
                     }
                 }
             }
-        }, "checkin-web-login").start()
-        return true
-    }
-
-    @Deprecated("WebView 需要处理返回栈；Android 13+ 的返回键回调由系统派发到这个方法")
-    override fun onBackPressed() {
-        val web = webView
-        if (web != null && web.canGoBack()) {
-            web.goBack()
-            return
         }
-        finish()
     }
 
-    override fun onDestroy() {
-        handler.removeCallbacksAndMessages(null)
-        webView?.apply {
+    private fun notice(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
+
+    private fun closePopup(web: WebView?) {
+        if (web == null || web !== popupWebView) return
+        root?.removeView(web)
+        destroyWeb(web)
+        popupWebView = null
+    }
+
+    private fun destroyWeb(web: WebView?) {
+        web?.apply {
             stopLoading()
             webViewClient = WebViewClient()
             webChromeClient = null
-            loadUrl("about:blank")
             destroy()
         }
+    }
+
+    /** 返回键/主动退出当场关闭提交门，不能等到异步 onDestroy 才生效。 */
+    override fun finish() {
+        stopLogin()
+        super.finish()
+    }
+
+    private fun stopLogin() {
+        if (closed) return
+        closed = true
+        commitGate.cancel()
+        importFuture?.cancel(true)
+        executor.shutdownNow()
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    override fun onDestroy() {
+        stopLogin()
+        destroyWeb(popupWebView)
+        destroyWeb(webView)
+        popupWebView = null
         webView = null
+        root = null
+        if (ownsSession) {
+            // 退出清理只碰临时浏览器状态，已加密保存的账号凭据不删。
+            WebStorage.getInstance().deleteAllData()
+            CookieManager.getInstance().removeAllCookies {
+                CookieManager.getInstance().flush()
+                LOGIN_OWNER.compareAndSet(owner, null)
+            }
+        }
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "CheckinWebLogin"
-        private const val COOKIE_POLL_MS = 1000L
+        private const val COOKIE_POLL_MS = 1_000L
+        private const val IMPORT_RETRY_MS = 5_000L
+        private const val MAX_IMPORT_ATTEMPTS = 5
+        private const val LOGIN_TIMEOUT_MS = 10 * 60_000L
+        private val LOGIN_OWNER = AtomicReference<Any?>(null)
+        private const val STORAGE_RESET_JS = "(function(){try{localStorage.clear();sessionStorage.clear();return 'cleared';}catch(e){return 'failed';}})()"
+        private const val PAGE_UID_JS = "(function(){try{var u=JSON.parse(localStorage.getItem('user')||'null');var id=u&&u.id;if((typeof id==='number'&&Number.isSafeInteger(id)&&id>0)||(typeof id==='string'&&/^[1-9][0-9]*$/.test(id)))return String(id);return null;}catch(e){return null;}})()"
 
         const val EXTRA_PROVIDER_ID = "providerId"
         const val EXTRA_LOGIN_URL = "loginUrl"

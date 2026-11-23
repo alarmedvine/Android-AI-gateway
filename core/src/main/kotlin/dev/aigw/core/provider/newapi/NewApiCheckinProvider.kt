@@ -6,6 +6,7 @@ import dev.aigw.core.provider.ACTION_CHECKIN
 import dev.aigw.core.provider.AuthKind
 import dev.aigw.core.provider.ChatCall
 import dev.aigw.core.provider.CreditInfo
+import dev.aigw.core.provider.CreditUnit
 import dev.aigw.core.provider.ErrorKind
 import dev.aigw.core.provider.FailedChatCall
 import dev.aigw.core.provider.Provider
@@ -17,7 +18,6 @@ import dev.aigw.core.provider.ProviderModelCatalogView
 import dev.aigw.core.provider.UpstreamError
 import dev.aigw.core.util.HttpSupport
 import dev.aigw.core.util.bodySnippet
-import dev.aigw.core.util.longOrNull
 import dev.aigw.core.util.objOrNull
 import dev.aigw.core.util.stringOrNull
 
@@ -85,30 +85,19 @@ class NewApiCheckinProvider(
 
     // ------------------------------------------------------------------ 额度
 
-    override fun creditInfo(account: ProviderAccount): CreditInfo? {
-        val credential = parse(account) ?: return CreditInfo(0, known = false, detail = "凭证无法解析")
-        return try {
-            val (status, text) = request(profile.userSelfPath, "GET", credential, null)
-            val payload = runCatching { JsonParser.parseString(text).asJsonObject }.getOrNull()
-            if (status !in 200..299 || payload?.get("success")?.asBoolean == false) {
-                val message = payload?.stringOrNull("message").orEmpty()
-                return CreditInfo(
-                    0,
-                    known = false,
-                    detail = message.ifEmpty { "查询余额失败（HTTP $status）" },
-                )
-            }
-            val data = payload?.objOrNull("data") ?: return CreditInfo(0, known = false, detail = "响应缺少 data")
-            val quota = data.longOrNull("quota") ?: return CreditInfo(0, known = false, detail = "响应缺少 quota")
-            val used = data.longOrNull("used_quota") ?: 0L
-            CreditInfo(
-                balance = quota / profile.quotaPerUnit,
-                known = true,
-                detail = "余额 ${dollars(quota)} · 已用 ${dollars(used)}",
-            )
-        } catch (e: Exception) {
-            CreditInfo(0, known = false, detail = e.message ?: "查询余额失败")
-        }
+    override fun creditInfo(account: ProviderAccount): CreditInfo? = try {
+        val credential = parse(account) ?: throw IllegalStateException("凭证无法解析")
+        val data = fetchSelf(credential, account.uid)
+        val quota = quotaValue(data, "quota", required = true)
+        val used = quotaValue(data, "used_quota", required = false)
+        CreditInfo(
+            balance = quota,
+            known = true,
+            detail = "余额 ${dollars(quota)} · 已用 ${dollars(used)}",
+            unit = CreditUnit.usdQuota(profile.quotaPerUnit),
+        )
+    } catch (e: Exception) {
+        CreditInfo(0, known = false, detail = e.message ?: "查询余额失败")
     }
 
     // ------------------------------------------------------------------ 签到
@@ -126,18 +115,10 @@ class NewApiCheckinProvider(
         val credential = parse(account) ?: return ProviderActionResult.failure("凭证无法解析")
         return try {
             if (profile.signInPath.isEmpty()) {
-                // AgentRouter 这类站点：查一次用户信息就是签到。
-                val (status, text) = request(profile.userSelfPath, "GET", credential, null)
-                val body = runCatching { JsonParser.parseString(text).asJsonObject }.getOrNull()
-                val ok = status in 200..299 && body?.get("success")?.asBoolean != false
-                if (!ok) {
-                    val message = body?.stringOrNull("message").orEmpty()
-                    return ProviderActionResult.failure(message.ifEmpty { "签到达失败（HTTP $status）" })
-                }
-                val quota = body?.objOrNull("data")?.longOrNull("quota")
-                return ProviderActionResult.success(
-                    if (quota != null) "已自动签到，当前余额 ${dollars(quota)}" else "已自动签到",
-                )
+                // 查询成功只确认有效账号与合法额度；不把 HTML/WAF/未知响应当成签到回执。
+                val data = fetchSelf(credential, account.uid)
+                val quota = quotaValue(data, "quota", required = true)
+                return ProviderActionResult.success("已完成站点自动签到查询，当前余额 ${dollars(quota)}")
             }
 
             val headers = mapOf(
@@ -149,13 +130,12 @@ class NewApiCheckinProvider(
             val message = body?.stringOrNull("message")
                 ?: body?.stringOrNull("msg")
                 ?: bodySnippet(text).removePrefix("：")
-            val success = body?.get("success")?.asBoolean == true ||
-                body?.get("ret")?.takeIf { it.isJsonPrimitive }?.asInt == 1 ||
-                body?.get("code")?.takeIf { it.isJsonPrimitive }?.asInt == 0
+            val success = trueBoolean(body, "success") ||
+                exactInteger(body, "ret") == 1L || exactInteger(body, "code") == 0L
             if (status in 200..299 && success) {
                 return ProviderActionResult.success(message.ifEmpty { "签到成功" })
             }
-            if (status in 200..299 && profile.alreadyCheckedKeywords.any { message.lowercase().contains(it) }) {
+            if (body != null && status in 200..299 && profile.alreadyCheckedKeywords.any { message.lowercase().contains(it) }) {
                 return ProviderActionResult.success("今日已签到：$message")
             }
             ProviderActionResult.failure(message.ifEmpty { "签到失败（HTTP $status）" })
@@ -182,15 +162,9 @@ class NewApiCheckinProvider(
             throw IllegalStateException("缺少 $SESSION_COOKIE cookie：请登录后复制整串 Cookie")
         }
         val credential = Credential(cookies, obj?.stringOrNull("apiUserId").orEmpty())
-        val (status, text) = request(profile.userSelfPath, "GET", credential, null)
-        val payload = runCatching { JsonParser.parseString(text).asJsonObject }.getOrNull()
-        val data = payload?.objOrNull("data")
-        if (status !in 200..299 || payload?.get("success")?.asBoolean == false || data == null) {
-            val message = payload?.stringOrNull("message").orEmpty()
-            throw IllegalStateException(message.ifEmpty { "Cookie 无效或已过期（HTTP $status）" })
-        }
-        val uid = data.longOrNull("id")?.toString()
-            ?: throw IllegalStateException("响应缺少用户 id，无法建立账号")
+        val data = fetchSelf(credential, credential.apiUserId.takeIf { it.isNotEmpty() })
+        val uid = positiveId(data, "id")
+            ?: throw IllegalStateException("响应缺少合法用户 id，无法建立账号")
         val nickname = data.stringOrNull("display_name")
             ?: data.stringOrNull("username")
             ?: uid
@@ -249,11 +223,54 @@ class NewApiCheckinProvider(
         }
     }
 
-    /** quota 换算成美元字符串（New API 默认 500000 quota = $1）。 */
-    private fun dollars(quota: Long): String {
-        val unit = profile.quotaPerUnit.takeIf { it > 0 } ?: 500_000
-        return "$" + String.format(java.util.Locale.US, "%.2f", quota.toDouble() / unit)
+    /** 三个入口共享同一个准入点：必须是明确成功的 JSON 和匹配的真实用户身份。 */
+    private fun fetchSelf(credential: Credential, expectedUid: String?): JsonObject {
+        if (expectedUid != null && positiveIdText(expectedUid) == null) {
+            throw IllegalStateException("保存的用户 id 无效，请重新登录")
+        }
+        if (credential.apiUserId.isNotEmpty() && expectedUid != null && credential.apiUserId != expectedUid) {
+            throw IllegalStateException("凭据用户 id 与账号不一致，请重新登录")
+        }
+        val (status, text) = request(profile.userSelfPath, "GET", credential, null)
+        val body = runCatching { JsonParser.parseString(text).asJsonObject }.getOrNull()
+        if (status !in 200..299 || !trueBoolean(body, "success")) {
+            val message = body?.stringOrNull("message").orEmpty()
+            throw IllegalStateException(message.ifEmpty { "用户信息校验失败（HTTP $status）" })
+        }
+        val data = body?.objOrNull("data") ?: throw IllegalStateException("响应缺少用户信息")
+        val uid = positiveId(data, "id") ?: throw IllegalStateException("响应缺少合法用户 id")
+        if (expectedUid != null && uid != expectedUid) {
+            throw IllegalStateException("响应用户与当前账号不一致，请重新登录")
+        }
+        quotaValue(data, "quota", required = true)
+        return data
     }
+
+    private fun trueBoolean(body: JsonObject?, name: String): Boolean =
+        body?.get(name)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean == true
+
+    private fun positiveId(data: JsonObject, name: String): String? =
+        data.get(name)?.takeIf { it.isJsonPrimitive }?.asString?.let(::positiveIdText)
+
+    private fun positiveIdText(text: String): String? =
+        text.takeIf { it.isNotEmpty() && it.all { c -> c in '0'..'9' } }
+            ?.toLongOrNull()?.takeIf { it > 0 }?.toString()
+
+    private fun quotaValue(data: JsonObject, name: String, required: Boolean): Long {
+        val value = data.get(name)
+        if (value == null && !required) return 0L
+        return exactInteger(data, name)?.takeIf { it >= 0 }
+            ?: throw IllegalStateException("响应缺少合法 $name")
+    }
+
+    private fun exactInteger(body: JsonObject?, name: String): Long? =
+        body?.get(name)?.takeIf { it.isJsonPrimitive && !it.asJsonPrimitive.isBoolean }
+            ?.asString?.let { runCatching { java.math.BigDecimal(it).longValueExact() }.getOrNull() }
+
+    /** quota 原值与金额显示分开，格式化不经过 Double，不截断余额。 */
+    private fun dollars(quota: Long): String =
+        CreditUnit.formatUsdQuota(quota, CreditUnit.usdQuota(profile.quotaPerUnit))
+            ?: throw IllegalStateException("美元换算比例无效")
 
     private companion object {
         /** New API 的会话 cookie 名；没有它就没有身份，签到必然失败。 */

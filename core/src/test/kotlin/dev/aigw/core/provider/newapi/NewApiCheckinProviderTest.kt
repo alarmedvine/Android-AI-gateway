@@ -86,7 +86,8 @@ class NewApiCheckinProviderTest {
         val provider = NewApiCheckinProvider(profile())
         val info = assertNotNull(provider.creditInfo(account()))
         assertTrue(info.known)
-        assertEquals(50L, info.balance)
+        assertEquals(25_000_000L, info.balance, "余额保存原始 quota，不截断成整数美元")
+        assertEquals("usd_quota:500000", info.unit)
         assertTrue(info.detail.contains("$50.00"), "detail 应带美元口径：${info.detail}")
         assertTrue(info.detail.contains("$1.00"), "已用额度也要换算：${info.detail}")
     }
@@ -189,6 +190,22 @@ class NewApiCheckinProviderTest {
         val call = provider.openChat(account(), "{}")
         assertEquals(501, call.status)
         assertTrue(provider.capabilities.contains(dev.aigw.core.provider.ProviderCapability.CHECKIN))
+    }
+
+    @Test
+    fun `POST成功字段不得字符串强转或小数截断`() {
+        respond("/api/user/sign_in", 200, """{"success":"true","ret":1.5,"code":0.5}""")
+        val result = NewApiCheckinProvider(profile("/api/user/sign_in"))
+            .performAction(account(), ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok)
+    }
+
+    @Test
+    fun `HTML含已签到字样也不能算POST成功`() {
+        respond("/api/user/sign_in", 200, "<html>今日已签到</html>")
+        val result = NewApiCheckinProvider(profile("/api/user/sign_in"))
+            .performAction(account(), ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok)
     }
 
     // ------------------------------------------------------------------ cookie

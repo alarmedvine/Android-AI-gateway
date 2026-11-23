@@ -293,7 +293,7 @@ class GatewayHttpServer(
                     aObj.addProperty("disabled", current.disabled)
 
                     if (current.creditsKnown) {
-                        if (current.creditUnit == CreditUnit.PERCENT) percentKnown = true else {
+                        if (current.creditUnit == CreditUnit.PERCENT) percentKnown = true else if (CreditUnit.isCredits(current.creditUnit)) {
                             totalCredits += current.credits
                             creditsKnown = true
                         }

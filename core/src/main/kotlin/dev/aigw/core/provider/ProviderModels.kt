@@ -34,11 +34,29 @@ data class CreditInfo(
 
 /** 余额单位取值（[CreditInfo.unit]）。 */
 object CreditUnit {
-    /** 积分 / 权益包份数，各家可相加做总量。 */
+    /** 查询额度的消费点必须只把这个单位（或历史空单位）计入积分合计。 */
     const val CREDITS = "credits"
 
     /** 配额剩余百分比（0~100），只能按账号展示，不能与积分类相加。 */
     const val PERCENT = "percent"
+
+    /** 金额仍保存原始 quota；比例带在单位里，避免小数美元被 Long 截断或混进积分。 */
+    fun usdQuota(quotaPerDollar: Long): String {
+        require(quotaPerDollar > 0) { "美元换算比例必须大于 0" }
+        return "usd_quota:$quotaPerDollar"
+    }
+
+    fun isCredits(unit: String): Boolean = unit.isEmpty() || unit == CREDITS
+
+    /** 非美元 quota 单位返回 null；格式化只影响显示，持久化/API 中的原始余额不丢精度。 */
+    fun formatUsdQuota(quota: Long, unit: String): String? {
+        if (!unit.startsWith("usd_quota:")) return null
+        val ratio = unit.removePrefix("usd_quota:").toLongOrNull()?.takeIf { it > 0 } ?: return null
+        val amount = java.math.BigDecimal.valueOf(quota).divide(
+            java.math.BigDecimal.valueOf(ratio), 2, java.math.RoundingMode.HALF_UP,
+        )
+        return "$" + amount.toPlainString()
+    }
 }
 
 /** provider 专属动作的结果。 */
