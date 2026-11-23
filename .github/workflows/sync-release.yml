@@ -213,11 +213,14 @@ jobs:
 
       - uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools platforms;android-36 build-tools;35.0.0'
+          # 跟随 app/build.gradle.kts 的 compileSdk/buildToolsVersion；上游升级 AGP 时只改这里
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
 
       - uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: '8.11.1'
+          # 跟随仓库里的 gradle-wrapper.properties（9.9.1），不再写死版本：
+          # 上游升级 AGP 会同时升 wrapper，写死会让同步构建在 AGP 版本检查阶段直接失败
+          gradle-version: 'wrapper'
 
       - name: 还原 release keystore
         env:
