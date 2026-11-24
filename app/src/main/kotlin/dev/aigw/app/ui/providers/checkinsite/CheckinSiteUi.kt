@@ -145,21 +145,16 @@ class CheckinSiteUi(override val id: String) : ProviderUi {
                                 actions.onNotice("这个站点没有内置签到配置")
                                 return@Button
                             }
-                            actions.onActionWithUiFallback(
-                                providerId = id,
-                                uid = status.uid,
-                                action = ACTION_CHECKIN,
-                                payload = JsonObject(),
-                                requireUi = {
-                                    context.startActivity(
-                                        CheckinOauthLoginActivity.intent(
-                                            context = context,
-                                            providerId = id,
-                                            uid = status.uid,
-                                        ),
-                                    )
-                                },
-                            )
+                            // 函数类型的调用不能用具名参数（Kotlin 限制）
+                            actions.onActionWithUiFallback(id, status.uid, ACTION_CHECKIN, JsonObject()) {
+                                context.startActivity(
+                                    CheckinOauthLoginActivity.intent(
+                                        context = context,
+                                        providerId = id,
+                                        uid = status.uid,
+                                    ),
+                                )
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("签到（需要时重新授权）") }
