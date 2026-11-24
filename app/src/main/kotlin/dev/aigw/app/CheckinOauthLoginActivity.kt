@@ -77,6 +77,8 @@ class CheckinOauthLoginActivity : ComponentActivity() {
     private var runStartMs = 0L
     private var attempts = 0
     private var callbackTicks = 0
+    /** 授权参数请求只发一次；页面可能多次 onPageFinished。 */
+    private var authorizeInFlight = false
 
     private val owner = Any()
     private var ownsSession = false
@@ -245,14 +247,23 @@ class CheckinOauthLoginActivity : ComponentActivity() {
                     }
                     CheckinLoginPolicy.isSitePage(page, target.domain) &&
                         !page.contains("github.com") -> {
-                        if (step == Step.OPEN_LOGIN) {
+                        // 首次进入或页面重载都重新取参数；authorizeInFlight 防重入。
+                        if (step == Step.OPEN_LOGIN || step == Step.FETCH_STATE) {
                             step = Step.FETCH_STATE
-                            setStatus("获取授权参数…")
                             fetchStateAndAuthorize(current, target)
                         }
                     }
+                    page.contains("github.com/login/oauth/authorize") -> {
+                        // 授权确认页（含「Reauthorization required」）。
+                        // 不点它 GitHub 永远不会 302 回站点 —— 社区脚本栽在这里。
+                        step = Step.AUTHORIZE
+                        setStatus("正在确认 GitHub 授权…")
+                        clickAuthorize(current)
+                        schedule()
+                    }
                     page.contains("github.com/login") -> {
                         // GitHub 会话已失效：交给用户手动登录一次，之后每天可全自动。
+                        // 登录页的输入框由系统键盘处理，不做任何注入。
                         step = Step.AUTHORIZE
                         setStatus("请在下方登录 GitHub（只需一次，之后自动）")
                         schedule()
@@ -268,46 +279,70 @@ class CheckinOauthLoginActivity : ComponentActivity() {
     /**
      * 走站点自己的授权入口：先拿 state，再拼 GitHub 授权 URL。
      *
-     * 不用写死 client_id：从 `/api/status` 的 `github_client_id` 现取，
-     * 站点换应用时不用改代码。
+     * **刻意不在 WebView 里用同步 XHR 取参数**：`evaluateJavascript` 会把 JS 返回值
+     * 再做一次 JSON 编码（JS 返回字符串 `{"cid":..}`，Kotlin 侧收到的是带转义的
+     * `"{\"cid\":..}"`），直接当 JsonObject 解析必然失败。改成原生 HTTP 后
+     * 不依赖页面上下文，也不必等 onPageFinished，且能在 `:core` 里纯 JVM 测。
+     *
+     * `/api/status` 与 `/api/oauth/state` 都是公开接口（实测 200），不需要 cookie；
+     * state 是服务端签名的一次性 token，不绑定会话。
      */
     private fun fetchStateAndAuthorize(web: WebView, target: NewApiSiteProfile) {
+        if (authorizeInFlight) return
+        authorizeInFlight = true
+        setStatus("获取授权参数…")
+        // 网络在主线程会抛 NetworkOnMainThreadException，必须挪到后台。
+        executor.execute {
+            val params = runCatching { CheckinOauthPolicy.fetchAuthorizeParams(target) }.getOrNull()
+            handler.post {
+                if (closed) return@post
+                if (params == null) {
+                    fail("拿不到站点授权参数（/api/status 或 /api/oauth/state 请求失败）")
+                    return@post
+                }
+                step = Step.AUTHORIZE
+                setStatus("正在通过 GitHub 授权…")
+                web.loadUrl(params)
+                schedule()
+            }
+        }
+    }
+
+    /**
+     * 在 GitHub 授权页点一次「Authorize / Reauthorize」。
+     *
+     * 只在 `github.com/login/oauth/authorize` 上调用：这是 GitHub 自己的授权确认页，
+     * 首次授权会显示「Authorize <app>」，之前授权过但需要再次确认时显示
+     * 「Reauthorization required」+ Reauthorize 按钮。两者都表现为一个 form submit。
+     *
+     * 找不到按钮就什么都不做，让用户自己点——**绝不**在这里做任何强制跳转。
+     */
+    private fun clickAuthorize(web: WebView) {
         val js = """
             (function(){
               try {
-                var x = new XMLHttpRequest();
-                x.open('GET', '/api/status', false);
-                x.send(null);
-                var st = JSON.parse(x.responseText || '{}');
-                var cid = (st.data && st.data.github_client_id) || '';
-                var y = new XMLHttpRequest();
-                y.open('GET', '/api/oauth/state?mode=login', false);
-                y.send(null);
-                var sj = JSON.parse(y.responseText || '{}');
-                var state = sj.data || '';
-                return JSON.stringify({cid: cid, state: state});
-              } catch (e) { return JSON.stringify({cid:'', state:'', error: String(e)}); }
+                // 1) 标准的授权提交按钮（name=authorize）
+                var b = document.querySelector('button[name="authorize"]')
+                     || document.querySelector('input[name="authorize"]')
+                     || document.querySelector('button[type="submit"]')
+                     || document.querySelector('form[action*="authorize"] button');
+                if (b) { b.click(); return 'clicked'; }
+                // 2) 兜底：按文案找（多语言界面）
+                var all = document.querySelectorAll('button, input[type="submit"], a.btn');
+                for (var i = 0; i < all.length; i++) {
+                  var t = (all[i].textContent || all[i].value || '').toLowerCase();
+                  if (t.indexOf('authorize') >= 0 || t.indexOf('授权') >= 0) {
+                    all[i].click();
+                    return 'clicked-text';
+                  }
+                }
+                return 'no-button';
+              } catch (e) { return 'error'; }
             })()
         """.trimIndent()
-        web.evaluateJavascript(js) { raw ->
-            if (closed) return@evaluateJavascript
-            val parsed = runCatching {
-                com.google.gson.JsonParser.parseString(raw ?: "").asJsonObject
-            }.getOrNull()
-            val clientId = parsed?.get("cid")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
-            val state = parsed?.get("state")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
-            if (clientId.isEmpty() || state.isEmpty()) {
-                fail("站点未开启 GitHub 登录，或拿不到授权参数")
-                return@evaluateJavascript
-            }
-            step = Step.AUTHORIZE
-            setStatus("正在通过 GitHub 授权…")
-            val authorize = "https://github.com/login/oauth/authorize" +
-                "?client_id=" + java.net.URLEncoder.encode(clientId, "UTF-8") +
-                "&state=" + java.net.URLEncoder.encode(state, "UTF-8") +
-                "&scope=user%3Aemail"
-            web.loadUrl(authorize)
-            schedule()
+        web.evaluateJavascript(js) { result ->
+            // 只记日志：结果不影响主流程，真正的完成信号是回到站点回调页。
+            Log.d(TAG, "authorize click: $result")
         }
     }
 

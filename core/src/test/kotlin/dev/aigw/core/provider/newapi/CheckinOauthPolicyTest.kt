@@ -3,6 +3,7 @@ package dev.aigw.core.provider.newapi
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -96,6 +97,64 @@ class CheckinOauthPolicyTest {
                 """{"message":"GitHub 授权失败，请重新登录 GitHub 授权（授权码已过期或被重复使用）","success":false}""",
             ),
         )
+    }
+
+    // ---------------------------------------------------------------- 授权参数
+
+    @Test
+    fun `授权参数从公开接口现取，不依赖 cookie`() {
+        val responses = mapOf(
+            "https://agentrouter.org/api/status" to
+                """{"success":true,"data":{"github_oauth":true,"github_client_id":"Ov23lidtiR4LeVZvVRNL","system_name":"Agent Router"}}""",
+            "https://agentrouter.org/api/oauth/state?mode=login" to
+                """{"success":true,"data":"eyJuIjoid0I2S2h1cWhKa2NlIiwibSI6ImxvZ2luIn0.sig","message":""}""",
+        )
+        val url = CheckinOauthPolicy.fetchAuthorizeParams(agentrouter) { responses[it] }
+        assertNotNull(url)
+        assertTrue(url!!.startsWith("https://github.com/login/oauth/authorize?"), url)
+        assertTrue(url.contains("client_id=Ov23lidtiR4LeVZvVRNL"), url)
+        assertTrue(url.contains("scope=user%3Aemail"), url)
+    }
+
+    @Test
+    fun `站点没开 GitHub 登录时返回 null 而不是假授权`() {
+        val noOauth = mapOf(
+            "https://agentrouter.org/api/status" to
+                """{"success":true,"data":{"github_oauth":false,"github_client_id":""}}""",
+        )
+        assertNull(CheckinOauthPolicy.fetchAuthorizeParams(agentrouter) { noOauth[it] })
+    }
+
+    @Test
+    fun `任一接口失败都返回 null`() {
+        // status 拿不到
+        assertNull(CheckinOauthPolicy.fetchAuthorizeParams(agentrouter) { null })
+        // status 有、state 拿不到
+        val onlyStatus = mapOf(
+            "https://agentrouter.org/api/status" to
+                """{"success":true,"data":{"github_client_id":"Ov1"}}""",
+        )
+        assertNull(CheckinOauthPolicy.fetchAuthorizeParams(agentrouter) { onlyStatus[it] })
+        // 返回 HTML（WAF 拦截）
+        val html = mapOf(
+            "https://agentrouter.org/api/status" to "<html>captcha</html>",
+            "https://agentrouter.org/api/oauth/state?mode=login" to "<html>captcha</html>",
+        )
+        assertNull(CheckinOauthPolicy.fetchAuthorizeParams(agentrouter) { html[it] })
+    }
+
+    @Test
+    fun `state 里的特殊字符会被正确转义`() {
+        val responses = mapOf(
+            "https://agentrouter.org/api/status" to """{"data":{"github_client_id":"Ov1"}}""",
+            "https://agentrouter.org/api/oauth/state?mode=login" to
+                """{"success":true,"data":"a+b/c=d&e"}""",
+        )
+        val url = CheckinOauthPolicy.fetchAuthorizeParams(agentrouter) { responses[it] }
+        assertNotNull(url)
+        // 未转义的 + / = & 会把 state 截断或改变含义
+        assertFalse(url!!.contains("state=a+b/c=d&e"), url)
+        assertTrue(url.contains("state=a%2Bb%2Fc%3Dd%26e"), url)
     }
 
     // ---------------------------------------------------------------- 日志判据

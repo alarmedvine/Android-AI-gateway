@@ -97,6 +97,57 @@ object CheckinOauthPolicy {
             ?.toLongOrNull()?.takeIf { it > 0 }?.toString()
     }.getOrNull()
 
+    /**
+     * 取 GitHub 授权所需的 client_id 与 state，拼成授权页 URL。
+     *
+     * 两个接口都是公开的（实测 `/api/status` 200、`/api/oauth/state` 200），
+     * state 是服务端签名的一次性 token、不绑定会话，所以**不需要任何 cookie**。
+     *
+     * @return 授权页 URL；任一步失败或参数为空时返回 null，由调用方报明确错误
+     */
+    fun fetchAuthorizeParams(
+        profile: NewApiSiteProfile,
+        httpGet: (String) -> String? = { url ->
+            runCatching {
+                val conn = dev.aigw.core.util.HttpSupport.open(
+                    url = url,
+                    method = "GET",
+                    headers = mapOf("Accept" to "application/json"),
+                    connectTimeoutMs = 15_000,
+                    readTimeoutMs = 20_000,
+                )
+                try {
+                    if (conn.responseCode !in 200..299) null
+                    else dev.aigw.core.util.HttpSupport.readBody(conn)
+                } finally {
+                    conn.disconnect()
+                }
+            }.getOrNull()
+        },
+    ): String? {
+        val base = profile.domain.trimEnd('/')
+        val statusBody = httpGet("$base/api/status") ?: return null
+        val clientId = runCatching {
+            JsonParser.parseString(statusBody).asJsonObject
+                .getAsJsonObject("data")?.get("github_client_id")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                ?.asString
+        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
+
+        val stateBody = httpGet("$base/api/oauth/state?mode=login") ?: return null
+        val state = runCatching {
+            JsonParser.parseString(stateBody).asJsonObject
+                .get("data")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                ?.asString
+        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
+
+        return "https://github.com/login/oauth/authorize" +
+            "?client_id=" + java.net.URLEncoder.encode(clientId, "UTF-8") +
+            "&state=" + java.net.URLEncoder.encode(state, "UTF-8") +
+            "&scope=user%3Aemail"
+    }
+
     /** 从响应体里取 `success` 严格布尔（不接受 "true"/1）。 */
     fun responseSuccess(body: String?): Boolean = runCatching {
         val obj = JsonParser.parseString(body ?: return false)
