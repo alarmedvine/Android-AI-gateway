@@ -136,6 +136,8 @@ class CheckinSiteUi(override val id: String) : ProviderUi {
                 // 站点没有签到接口：额度只在一次新的 OAuth 登录里发放，
                 // 必须重走一遍 GitHub 授权（见 CheckinOauthLoginActivity）。
                 CheckinMode.OAUTH_RELOGIN -> {
+                    // 先试纯 HTTP（已保存 GitHub 会话时完全静默完成）；
+                    // 只有 GitHub 会话失效/需要确认授权时才打开 WebView。
                     Button(
                         onClick = {
                             val target = profile
@@ -143,18 +145,27 @@ class CheckinSiteUi(override val id: String) : ProviderUi {
                                 actions.onNotice("这个站点没有内置签到配置")
                                 return@Button
                             }
-                            context.startActivity(
-                                CheckinOauthLoginActivity.intent(
-                                    context = context,
-                                    providerId = id,
-                                    uid = status.uid,
-                                ),
+                            actions.onActionWithUiFallback(
+                                providerId = id,
+                                uid = status.uid,
+                                action = ACTION_CHECKIN,
+                                payload = JsonObject(),
+                                requireUi = {
+                                    context.startActivity(
+                                        CheckinOauthLoginActivity.intent(
+                                            context = context,
+                                            providerId = id,
+                                            uid = status.uid,
+                                        ),
+                                    )
+                                },
                             )
                         },
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("重新授权签到") }
+                    ) { Text("签到（需要时重新授权）") }
                     Text(
-                        text = "该站点的签到就是重新登录一次 GitHub：只查余额不会增加额度。",
+                        text = "该站点的签到就是重新登录一次 GitHub。已保存登录态时直接完成，" +
+                            "否则会打开授权页让你确认一次。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

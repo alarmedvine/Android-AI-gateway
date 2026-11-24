@@ -154,14 +154,31 @@ class NewApiCheckinProviderTest {
     fun `无签到接口的站点不能靠查询用户信息冒充签到`() {
         // 这条曾经断言「查一次 /api/user/self 就算签到成功」，那是错的：
         // AgentRouter 的额度只在一次新的 OAuth 登录里发放，查余额永远不加额度。
-        // 现在这种配置必须明确失败，并指向真正的签到入口。
+        // 现在没有保存 GitHub 会话时，必须明确失败并指出要先授权一次。
         respond("/api/user/self", 200, selfOk(quota = 30_000_000))
         val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
         val result = provider.performAction(account(), ACTION_CHECKIN, com.google.gson.JsonObject())
         assertFalse(result.ok, result.message)
-        assertTrue(result.message.contains("重新登录"), result.message)
+        // 文案会改，所以断言的是 requiresUi 这个位而不是措辞
+        assertTrue(result.requiresUi, "必须标记为需要界面接手：${result.message}")
         // 关键：不能再悄悄打 /api/user/self 然后报成功
         assertTrue(lastMethod.isNullOrEmpty(), "不该发出任何请求，实际 $lastMethod")
+    }
+
+    @Test
+    fun `有 GitHub 会话时批量签到会真的执行而不是只提示`() {
+        // 批量签到（AutoCheckin）没有 UI，必须能纯 HTTP 完成。
+        // 这里验证它至少不会在"有 GitHub 会话"时直接返回"请手动点"。
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        // 本地没有真 GitHub，流程会失败，但**不能**是"请手动点"那条文案
+        assertFalse(result.ok, result.message)
+        assertFalse(
+            result.message.contains("请点一次「重新授权签到」"),
+            "有 GitHub 会话时不该再要求手动操作：${result.message}",
+        )
     }
 
     @Test

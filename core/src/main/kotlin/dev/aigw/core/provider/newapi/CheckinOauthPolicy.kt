@@ -148,6 +148,23 @@ object CheckinOauthPolicy {
             "&scope=user%3Aemail"
     }
 
+    /** 从 `/api/oauth/state?mode=login` 的响应里取签名 state。 */
+    fun parseState(body: String?): String? = runCatching {
+        JsonParser.parseString(body ?: return null).asJsonObject
+            .get("data")
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+            ?.asString
+    }.getOrNull()?.takeIf { it.isNotEmpty() }
+
+    /** 从 `/api/status` 的响应里取 GitHub OAuth 的 client_id。 */
+    fun parseClientId(body: String?): String? = runCatching {
+        JsonParser.parseString(body ?: return null).asJsonObject
+            .getAsJsonObject("data")
+            ?.get("github_client_id")
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+            ?.asString
+    }.getOrNull()?.takeIf { it.isNotEmpty() }
+
     /** 从响应体里取 `success` 严格布尔（不接受 "true"/1）。 */
     fun responseSuccess(body: String?): Boolean = runCatching {
         val obj = JsonParser.parseString(body ?: return false)

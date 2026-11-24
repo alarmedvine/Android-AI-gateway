@@ -1698,6 +1698,37 @@ class AppViewModel(
         _state.value = _state.value.copy(batchOutcome = null)
     }
 
+    /**
+     * 动作优先静默执行；只有 provider 明确标记 [ProviderActionResult.requiresUi] 时才请界面接手。
+     *
+     * 这样「已保存登录态」的账号点一下就直接完成，不必每次都弹浏览器。
+     */
+    fun performActionWithUiFallback(
+        providerId: String,
+        uid: String,
+        action: String,
+        payload: JsonObject,
+        requireUi: () -> Unit,
+    ) {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { engine.performAction(providerId, uid, action, payload) }
+                    .getOrElse { ProviderActionResult.failure(it.message ?: "操作失败") }
+            }
+            when {
+                result.ok -> {
+                    _state.value = _state.value.copy(notice = result.message.ifEmpty { "操作完成" })
+                    refresh()
+                }
+                result.requiresUi -> requireUi()
+                else -> {
+                    _state.value = _state.value.copy(notice = result.message.ifEmpty { "操作失败" })
+                    refresh()
+                }
+            }
+        }
+    }
+
     fun performAction(providerId: String, uid: String, action: String, payload: JsonObject = JsonObject()) = action {
         val result: ProviderActionResult = engine.performAction(providerId, uid, action, payload)
         if (!result.ok) throw IllegalStateException(result.message)

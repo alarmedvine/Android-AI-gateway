@@ -122,10 +122,10 @@ class NewApiCheckinProvider(
                 // 上一版正是这样让用户以为签到成功、实际额度一分没动。
                 // 真正的签到由 CheckinOauthLoginActivity 重走一遍 GitHub 授权完成，
                 // 判据见 CheckinLogClient（站点日志里的签到记录）。
-                CheckinMode.OAUTH_RELOGIN -> return ProviderActionResult.failure(
-                    "「${profile.name}」的签到就是重新登录一次 GitHub：请点「重新授权签到」。" +
-                        "该站点没有签到接口，只查余额不会增加额度。",
-                )
+                // 没有签到接口：额度只在一次新的 OAuth 登录里发放。
+                // 用纯 HTTP 走完整个流程（不依赖 WebView），这样后台批量签到也能自动跑；
+                // 只有 GitHub 会话真的失效时才需要用户在应用内点一次重新登录。
+                CheckinMode.OAUTH_RELOGIN -> return oauthCheckin(account)
 
                 CheckinMode.API -> Unit
             }
@@ -155,6 +155,68 @@ class NewApiCheckinProvider(
             ProviderActionResult.failure(e.message ?: "签到失败")
         }
     }
+
+    /**
+     * 走一遍纯 HTTP 的 GitHub OAuth 完成签到。
+     *
+     * 成功时把站点下发的新会话（可能轮换）与当日签到结果一起回写账号池，
+     * 这样下一次批量签到不必再要用户点任何东西。
+     */
+    private fun oauthCheckin(account: ProviderAccount): ProviderActionResult {
+        val credential = parse(account) ?: return ProviderActionResult.failure("凭证无法解析")
+        val githubCookies = githubCookiesOf(account)
+        if (githubCookies.isEmpty()) {
+            return ProviderActionResult.requiresUi(
+                "「${profile.name}」还没有保存 GitHub 登录态：需要先授权一次，之后每天可自动完成",
+            )
+        }
+        val client = CheckinOauthClient(profile)
+        return when (val outcome = client.checkin(credential.cookies, githubCookies)) {
+            is CheckinOauthClient.Outcome.Completed -> {
+                if (outcome.cookies.isNotEmpty()) {
+                    persistSiteCookies(account, credential, outcome.cookies)
+                }
+                val quota = runCatching {
+                    val data = fetchSelf(parse(account)?.copy(cookies = mergedCookies(credential, outcome.cookies)) ?: credential, account.uid)
+                    quotaValue(data, "quota", required = true)
+                }.getOrNull()
+                val tail = quota?.let { "，当前余额 ${dollars(it)}" }.orEmpty()
+                if (outcome.checkedIn) {
+                    ProviderActionResult.success("已通过 GitHub 登录完成签到$tail")
+                } else {
+                    ProviderActionResult.success("今日额度已发放（登录时由站点自动完成）$tail")
+                }
+            }
+            CheckinOauthClient.Outcome.NeedsRelogin -> ProviderActionResult.requiresUi(
+                "「${profile.name}」的 GitHub 登录态已失效：需要重新授权一次",
+            )
+            CheckinOauthClient.Outcome.NeedsAuthorize -> ProviderActionResult.requiresUi(
+                "GitHub 要求重新确认授权：需要在授权页上批准一次",
+            )
+            is CheckinOauthClient.Outcome.Failed -> ProviderActionResult.failure(outcome.reason)
+        }
+    }
+
+    /** 把站点新下发的 cookie 合进账号凭证（保留 githubCookies 等其它字段）。 */
+    private fun persistSiteCookies(
+        account: ProviderAccount,
+        credential: Credential,
+        fresh: Map<String, String>,
+    ) {
+        val merged = mergedCookies(credential, fresh)
+        val secret = runCatching {
+            JsonParser.parseString(account.secret).asJsonObject.apply {
+                addProperty("cookies", CheckinCookie.format(merged))
+            }.toString()
+        }.getOrNull() ?: return
+        hooks.onAccountUpdated(account.copy(secret = secret))
+    }
+
+    private fun mergedCookies(
+        credential: Credential,
+        fresh: Map<String, String>,
+    ): Map<String, String> =
+        if (fresh.isEmpty()) credential.cookies else CheckinCookie.merge(credential.cookies, fresh)
 
     // ------------------------------------------------------------------ 签到方式（供 UI 分派）
 

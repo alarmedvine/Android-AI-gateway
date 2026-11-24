@@ -77,6 +77,9 @@ fun ProviderDetailScreen(
             },
             onRefreshCredits = { id, uid -> viewModel.refreshCredits(id, uid) },
             onAction = { id, uid, action, payload -> viewModel.performAction(id, uid, action, payload) },
+            onActionWithUiFallback = { id, uid, action, payload, requireUi ->
+                viewModel.performActionWithUiFallback(id, uid, action, payload, requireUi)
+            },
             onToggleAccount = { id, uid, enabled -> viewModel.setAccountEnabled(id, uid, enabled) },
             onRemoveAccount = { id, uid -> viewModel.removeAccount(id, uid) },
             onUpdateSecret = { id, uid, secret, notice ->
