@@ -165,6 +165,39 @@ class NewApiCheckinProviderTest {
     }
 
     @Test
+    fun `导入时保存 github 会话，供签到免登录`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val raw = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh; logged_in=yes"}"""
+        val imported = assertNotNull(provider.importCredentials(raw))
+        // 存进去
+        assertEquals("user_session=gh; logged_in=yes", provider.githubCookiesOf(imported))
+    }
+
+    @Test
+    fun `没带 github 会话的导入不会凭空造一个`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val imported = assertNotNull(provider.importCredentials("""{"cookies":"session=abc","apiUserId":"42"}"""))
+        assertEquals("", provider.githubCookiesOf(imported))
+    }
+
+    @Test
+    fun `两个账号的 github 会话互不串`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val a = assertNotNull(provider.importCredentials(
+            """{"cookies":"session=a","apiUserId":"42","githubCookies":"user_session=ghA"}""",
+        ))
+        val b = assertNotNull(provider.importCredentials(
+            """{"cookies":"session=b","apiUserId":"42","githubCookies":"user_session=ghB"}""",
+        ))
+        // 这条是防「签成别人账号」的关键：两个账号必须各存各的
+        assertEquals("user_session=ghA", provider.githubCookiesOf(a))
+        assertEquals("user_session=ghB", provider.githubCookiesOf(b))
+    }
+
+    @Test
     fun `OAuth 站点的签到方式对外可见`() {
         val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
         assertEquals(CheckinMode.OAUTH_RELOGIN, provider.checkinMode())

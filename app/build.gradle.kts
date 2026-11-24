@@ -35,8 +35,8 @@ android {
         minSdk = 26
         targetSdk = 36
         // 与上一版（234 / 2.38.4）区分开：同一版本号无法在真机上判断是否装上了新包。
-        versionCode = 236
-        versionName = "2.38.6"
+        versionCode = 237
+        versionName = "2.38.7"
     }
 
     buildFeatures {

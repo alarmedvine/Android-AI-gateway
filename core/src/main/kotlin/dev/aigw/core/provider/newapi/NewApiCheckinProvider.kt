@@ -161,6 +161,13 @@ class NewApiCheckinProvider(
     /** 该站点怎么签到。UI 据此决定显示「立即签到」还是「重新授权签到」。 */
     fun checkinMode(): CheckinMode = profile.checkinMode
 
+    /** 这个账号保存的 github.com 会话（没有则空串 = 需要用户先登录一次）。 */
+    fun githubCookiesOf(account: ProviderAccount): String {
+        val obj = runCatching { JsonParser.parseString(account.secret).asJsonObject }.getOrNull()
+            ?: return ""
+        return obj.stringOrNull("githubCookies").orEmpty()
+    }
+
     /** 站点配置（UI 需要 domain / 展示名来拉起授权页）。 */
     fun siteProfile(): NewApiSiteProfile = profile
 
@@ -203,6 +210,12 @@ class NewApiCheckinProvider(
         val secret = JsonObject().apply {
             addProperty("cookies", CheckinCookie.format(cookies))
             addProperty("apiUserId", uid)
+            // GitHub 会话一并保存：签到时要把这个账号自己的 GitHub 登录态注回 WebView，
+            // 否则每次签到都要重新输一次 GitHub 密码 + 重新批准授权。
+            // 多账号绝不能共用——A 的会话拿去签 B 会签成 A。
+            obj?.stringOrNull("githubCookies")?.takeIf { it.isNotEmpty() }?.let {
+                addProperty("githubCookies", it)
+            }
         }.toString()
         hooks.onLog("「${profile.name}」导入账号：$nickname（uid=$uid）")
         return ProviderAccount(

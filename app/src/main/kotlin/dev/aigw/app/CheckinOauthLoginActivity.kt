@@ -158,13 +158,21 @@ class CheckinOauthLoginActivity : ComponentActivity() {
             override fun handleOnBackPressed() { fail("已取消签到") }
         })
 
-        // 只清站点自己的会话：GitHub 的登录状态必须留着，否则每天的自动签到
-        // 会掉到 GitHub 登录页，而应用内无法完成那一步。
+        // 清空全部 cookie 再注入本账号的 GitHub 会话。
+        //
+        // 两个账号对应两个不同的 GitHub 身份，而 WebView 的 cookie 是进程级共享的：
+        // 只清站点的话，GitHub 那边留的是最后一次登录的账号，签到会签到别人身上。
+        // 每个账号各存一份 github cookie（导入时由 CheckinWebLoginActivity 读取），
+        // 这里注回去，就能做到「每个账号只在首次导入时登录一次 GitHub，之后零输入」。
         step = Step.PREPARE
-        setStatus("清理站点会话…")
-        clearSiteCookies(target) {
-            if (closed) return@clearSiteCookies
-            CookieManager.getInstance().flush()
+        setStatus("准备授权…")
+        val ghCookies = savedGithubCookies()
+        WebStorage.getInstance().deleteAllData()
+        CookieManager.getInstance().removeAllCookies {
+            if (closed) return@removeAllCookies
+            val manager = CookieManager.getInstance()
+            if (ghCookies.isNotEmpty()) injectCookies(manager, ghCookies)
+            manager.flush()
             step = Step.OPEN_LOGIN
             setStatus("打开站点登录页…")
             web.loadUrl(CheckinOauthPolicy.loginUrl(target))
@@ -347,6 +355,63 @@ class CheckinOauthLoginActivity : ComponentActivity() {
     }
 
     /**
+     * 把当前 WebView 里 github.com 的会话写回账号凭证。
+     *
+     * 只增改 `githubCookies` 这一个字段，站点 cookies / apiUserId 原样保留
+     * （不能整体覆盖：那会把 provider 维护的其他字段抹掉）。
+     */
+    private fun persistGithubCookies() {
+        val engine = (application as? AiGatewayApp)?.engine ?: return
+        val account = engine.account(providerId, uid) ?: return
+        val fresh = runCatching {
+            CookieManager.getInstance().getCookie("https://github.com").orEmpty().trim()
+        }.getOrDefault("")
+        if (fresh.isEmpty()) return
+        val secret = runCatching {
+            val obj = com.google.gson.JsonParser.parseString(account.secret).asJsonObject
+            obj.addProperty("githubCookies", fresh)
+            obj.toString()
+        }.getOrNull() ?: return
+        // 写盘 + 加密，不能压在主线程；最多等 2 秒，超时就放弃（下次签到再写）。
+        val writer = Thread {
+            runCatching { engine.updateAccountSecret(providerId, uid, secret) }
+                .onFailure { Log.d(TAG, "github cookie 回写失败: ${it.message}") }
+        }
+        writer.start()
+        runCatching { writer.join(2000) }
+    }
+
+    /** 本账号在导入时保存的 github.com 会话（可能为空 = 需要用户手动登录一次）。 */
+    private fun savedGithubCookies(): String {
+        val engine = (application as? AiGatewayApp)?.engine ?: return ""
+        val account = engine.account(providerId, uid) ?: return ""
+        val provider = engine.registry.get(providerId)
+            as? dev.aigw.core.provider.newapi.NewApiCheckinProvider ?: return ""
+        return provider.githubCookiesOf(account)
+    }
+
+    /**
+     * 把保存的 `k=v; k=v` 注入到 github.com。
+     *
+     * GitHub 的会话 cookie（`user_session`）是 HttpOnly + Secure，`document.cookie`
+     * 读不到，但 native 的 CookieManager 两端都能读写，所以这条链是通的。
+     */
+    private fun injectCookies(manager: CookieManager, raw: String) {
+        for (part in raw.split(";")) {
+            val item = part.trim()
+            if (item.isEmpty()) continue
+            val eq = item.indexOf('=')
+            if (eq <= 0) continue
+            val name = item.substring(0, eq).trim()
+            val value = item.substring(eq + 1).trim()
+            if (name.isEmpty() || value.isEmpty()) continue
+            // 只写 host-only（不带 Domain）一条：同名 cookie 写两个域会变成两份，
+            // 上游可能因此认不出会话。开机时已经 removeAllCookies 过，不存在旧条目。
+            runCatching { manager.setCookie("https://github.com", "$name=$value; Path=/") }
+        }
+    }
+
+    /**
      * 只清理指定源（站点）的 cookie。
      *
      * Android 没有「按域删除」的 API，只能对每枚已知 cookie 写一条立即过期的同名项。
@@ -433,6 +498,10 @@ class CheckinOauthLoginActivity : ComponentActivity() {
                 (application as? AiGatewayApp)?.engine?.refreshCredits(providerId, uid)
             }
         }
+        // GitHub 在授权过程中可能轮换会话 cookie；把当前实际值写回，
+        // 下次签到才能继续免登录。失败也写——会话本身仍是有效的。
+        persistGithubCookies()
+
         when (result.outcome) {
             CheckinLogClient.Outcome.FRESH -> {
                 notice("签到成功，额度已到账")
