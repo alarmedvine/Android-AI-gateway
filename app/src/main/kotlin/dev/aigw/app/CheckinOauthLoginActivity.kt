@@ -502,10 +502,8 @@ class CheckinOauthLoginActivity : ComponentActivity() {
                     // 先把新会话写回账号池，否则核验用的还是旧 cookie。
                     val fresh = account.copy(secret = secretWith(cookies, account.secret))
                     engine.updateAccountSecret(providerId, uid, fresh.secret)
-                    // 判据与 provider 一致：签到前后余额差。日志接口（CheckinLogClient）
-                    // 在 AgentRouter 上是否可用从未验证过，不能当唯一证据。
-                    val after = provider.creditInfo(fresh)?.takeIf { it.known }?.balance
-                    CheckinQuotaDelta.verdict(quotaBefore, after)
+                    // 判据与纯 HTTP 路径一致：签到前后余额差 + 站点 checked_in。
+                    provider.verifyByQuota(fresh, quotaBefore)
                 }
             }.getOrElse { null }
             handler.post {
@@ -542,9 +540,14 @@ class CheckinOauthLoginActivity : ComponentActivity() {
                 notice("签到成功，额度已到账")
                 setResult(RESULT_OK)
             }
-            // 登录成功了但额度没动：可能今天早些时候已经签过。不能报成功。
-            CheckinQuotaDelta.Kind.UNCHANGED -> {
-                notice("登录完成，但额度没有变化 —— 今天可能已经签过")
+            // 站点说今天已签过、余额没动：今天的目标已达成，不是失败。
+            CheckinQuotaDelta.Kind.ALREADY_DONE -> {
+                notice("今天已经签过了，本次没有新增额度")
+                setResult(RESULT_OK)
+            }
+            // 登录成功但额度没发、站点也没说签过：如实报失败。
+            CheckinQuotaDelta.Kind.NOT_CREDITED -> {
+                notice("登录完成，但额度没有变化，签到可能没有生效")
                 setResult(RESULT_CANCELED)
             }
             CheckinQuotaDelta.Kind.AFTER_ONLY,

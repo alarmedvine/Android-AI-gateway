@@ -79,8 +79,13 @@ class NewApiCheckinProviderTest {
             secret = secret,
         )
 
-    private fun selfOk(quota: Long = 25_000_000, used: Long = 500_000) = """
-        {"success":true,"data":{"id":42,"username":"u","display_name":"测试账号","quota":$quota,"used_quota":$used}}
+    private fun selfOk(
+        quota: Long = 25_000_000,
+        used: Long = 500_000,
+        checkedIn: Boolean = false,
+    ) = """
+        {"success":true,"data":{"id":42,"username":"u","display_name":"测试账号",
+        "quota":$quota,"used_quota":$used,"checked_in":$checkedIn}}
     """.trimIndent()
 
     /** 只回放固定结局的签到执行器，用来钉住 provider 的判据接线。 */
@@ -216,10 +221,11 @@ class NewApiCheckinProviderTest {
     }
 
     @Test
-    fun `OAuth 站点签到时余额没变必须报失败`() {
-        // 这是最关键的一条负控：checked_in=true 但额度一分没动。
-        // 上一版就是在这里报成功，用户看到「签到成功」而余额不变。
-        respond("/api/user/self", 200, selfOk(quota = 25_000_000))
+    fun `余额没变但站点说今天已签过时算达成不算失败`() {
+        // 当天已签过：额度本来就不会再涨。若报失败，自动签到会每小时重走一遍 OAuth，
+        // 一整天刷满失败记录，还可能触发上游风控。
+        // selfOk 默认不带 checked_in，这里显式给 true。
+        respond("/api/user/self", 200, selfOk(quota = 25_000_000, checkedIn = true))
         val provider = NewApiCheckinProvider(
             profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
             oauthRunner = StubOauth(
@@ -232,7 +238,28 @@ class NewApiCheckinProviderTest {
         )
         val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
         val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
-        assertFalse(result.ok, "额度没变绝不能报成功：${result.message}")
+        assertTrue(result.ok, "今天已签过不是失败：${result.message}")
+        assertTrue(result.message.contains("已经签过"), result.message)
+    }
+
+    @Test
+    fun `余额没变且站点没说签过时必须报失败`() {
+        // 上一版就是在这里报成功，用户看到「签到成功」而余额不变。
+        // selfOk 默认 checked_in=false，模拟「登录了但额度真没发」。
+        respond("/api/user/self", 200, selfOk(quota = 25_000_000, checkedIn = false))
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(
+                CheckinOauthClient.Outcome.Completed(
+                    cookies = emptyMap(),
+                    checkedIn = false,
+                    body = """{"success":true,"data":{"id":42,"checked_in":false}}""",
+                ),
+            ),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, "额度没变且站点没说签过，绝不能报成功：${result.message}")
         assertTrue(result.message.contains("没有变化"), result.message)
     }
 

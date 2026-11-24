@@ -198,17 +198,21 @@ class NewApiCheckinProvider(
                 val quotaAfter = runCatching {
                     quotaValue(fetchSelf(freshCredential, account.uid), "quota", true)
                 }.getOrNull()
-                val verdict = CheckinQuotaDelta.verdict(quotaBefore, quotaAfter)
+                val verdict = CheckinQuotaDelta.verdict(quotaBefore, quotaAfter, outcome.checkedIn)
                 when (verdict.kind) {
-                    // 余额真的涨了：这是唯一能报「签到成功」的情形。
+                    // 余额真的涨了：这是最硬的成功证据。
                     CheckinQuotaDelta.Kind.INCREASED -> ProviderActionResult.success(
                         "签到成功，本次新增 ${dollars(verdict.delta)}，当前余额 ${dollars(verdict.after ?: 0)}",
                     )
-                    // 额度没动：可能今天早些时候已经签过，也可能站点没发。
-                    // 不能报成功——那正是上一版的病。
-                    CheckinQuotaDelta.Kind.UNCHANGED -> ProviderActionResult.failure(
-                        "登录完成，但额度没有变化（${dollars(verdict.after ?: 0)}）——今天可能已经签过；" +
-                            "若确定没签过，请检查站点是否仍在发放签到额度",
+                    // 余额没变但站点说今天已签过：今天的目标已达成，不是失败。
+                    // 若报失败，自动签到会每小时重走一遍 OAuth 刷满失败记录。
+                    CheckinQuotaDelta.Kind.ALREADY_DONE -> ProviderActionResult.success(
+                        "今天已经签过了，本次没有新增额度（当前余额 ${dollars(verdict.after ?: 0)}）",
+                    )
+                    // 余额没变、站点也没说签过：登录成功但额度没发，真失败。
+                    CheckinQuotaDelta.Kind.NOT_CREDITED -> ProviderActionResult.failure(
+                        "登录完成，但额度没有变化（${dollars(verdict.after ?: 0)}），" +
+                            "站点也没有标记今日已签到 —— 签到可能没有生效",
                     )
                     CheckinQuotaDelta.Kind.AFTER_ONLY -> ProviderActionResult.success(
                         "已重新登录「${profile.name}」，当前余额 ${dollars(verdict.after ?: 0)}",
@@ -273,6 +277,24 @@ class NewApiCheckinProvider(
         val credential = parse(account)
             ?: return CheckinLogClient.Result(CheckinLogClient.Outcome.ERROR, "凭证无法解析")
         return CheckinLogClient(profile).verify(credential.cookies, account.uid, runStartMs)
+    }
+
+    /**
+     * 界面走完 WebView 授权后，用「签到前后余额差 + 站点 checked_in」核验结果。
+     *
+     * WebView 那条路拿不到兑换接口的响应体，所以 `checked_in` 只能从
+     * `/api/user/self` 的 `data.checked_in` 读（New-API 会把这个位一起返回）。
+     * 判据与纯 HTTP 路径完全一致，见 [CheckinQuotaDelta]。
+     *
+     * @param quotaBefore 授权开始前读到的余额（quota 原值）；null = 没读到基线
+     */
+    fun verifyByQuota(account: ProviderAccount, quotaBefore: Long?): CheckinQuotaDelta.Verdict {
+        val credential = parse(account)
+            ?: return CheckinQuotaDelta.verdict(quotaBefore, null)
+        val data = runCatching { fetchSelf(credential, account.uid) }.getOrNull()
+        val after = data?.let { runCatching { quotaValue(it, "quota", required = true) }.getOrNull() }
+        val claimed = data?.let { trueBoolean(it, "checked_in") }
+        return CheckinQuotaDelta.verdict(quotaBefore, after, claimed)
     }
 
     // ------------------------------------------------------------------ 凭证
