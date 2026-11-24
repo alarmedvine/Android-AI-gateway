@@ -14,7 +14,6 @@ import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
-import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -24,11 +23,11 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import com.google.gson.JsonObject
-import dev.aigw.core.gateway.AccountImportGate
 import dev.aigw.core.provider.newapi.CheckinCookie
 import dev.aigw.core.provider.newapi.CheckinLoginPolicy
-import dev.aigw.core.provider.newapi.CheckinLogClient
 import dev.aigw.core.provider.newapi.CheckinOauthPolicy
+import dev.aigw.core.provider.newapi.CheckinQuotaDelta
+import dev.aigw.core.provider.newapi.NewApiCheckinProvider
 import dev.aigw.core.provider.newapi.NewApiSiteProfile
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -75,15 +74,20 @@ class CheckinOauthLoginActivity : ComponentActivity() {
     private var closed = false
     private var step = Step.PREPARE
     private var startedAt = 0L
-    private var runStartMs = 0L
-    private var attempts = 0
+    /**
+     * 开始签到前读到的余额（quota 原值）。
+     *
+     * 这是**唯一**能证明「这次真的加了额度」的基线：`checked_in` 对当天已签过的账号
+     * 同样为 true，日志接口在 AgentRouter 上是否可用也未验证。读不到就记 null，
+     * 判据会退化成「无法比较」，如实报而不是猜成功。
+     */
+    private var quotaBefore: Long? = null
     private var callbackTicks = 0
     /** 授权参数请求只发一次；页面可能多次 onPageFinished。 */
     private var authorizeInFlight = false
 
     private val owner = Any()
     private var ownsSession = false
-    private val commitGate = AccountImportGate()
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "checkin-oauth-relogin").apply { isDaemon = true }
     }
@@ -129,7 +133,6 @@ class CheckinOauthLoginActivity : ComponentActivity() {
         ownsSession = true
         profile = target
         startedAt = SystemClock.elapsedRealtime()
-        runStartMs = System.currentTimeMillis()
 
         val frame = FrameLayout(this)
         root = frame
@@ -159,18 +162,42 @@ class CheckinOauthLoginActivity : ComponentActivity() {
             override fun handleOnBackPressed() { fail("已取消签到") }
         })
 
-        // 清空全部 cookie 再注入本账号的 GitHub 会话。
+        // 只清站点源，绝不碰 github.com。
         //
-        // 两个账号对应两个不同的 GitHub 身份，而 WebView 的 cookie 是进程级共享的：
-        // 只清站点的话，GitHub 那边留的是最后一次登录的账号，签到会签到别人身上。
-        // 每个账号各存一份 github cookie（导入时由 CheckinWebLoginActivity 读取），
-        // 这里注回去，就能做到「每个账号只在首次导入时登录一次 GitHub，之后零输入」。
+        // 这里**不能**用 removeAllCookies：它会把 github.com 的会话一起清掉，
+        // 而应用内 WebView 无法完成 GitHub 的密码 / 2FA 登录 —— 用户会卡在 GitHub 登录页，
+        // 每天都要重新输一次密码。社区实现（AnnaKarelovsky/AgentRouterautoCheckin）
+        // 明确只清站点源就是为了留住 GitHub 会话。
+        //
+        // 多账号串号的风险由「注入前先清站点源 + 按账号注入各自的 githubCookies」解决：
+        // 两个账号各存一份 GitHub 会话（导入时由 CheckinWebLoginActivity 读取）。
         step = Step.PREPARE
         setStatus("准备授权…")
         val ghCookies = savedGithubCookies()
-        WebStorage.getInstance().deleteAllData()
-        CookieManager.getInstance().removeAllCookies {
-            if (closed) return@removeAllCookies
+        // 先读完签到前余额再往下走。
+        //
+        // 不能「异步去读、主线程继续跑」：那样核验时 quotaBefore 可能还是 null，
+        // 判据退化成「无法比较」，用户会看到一句含糊的「已重新登录」而不是明确结果。
+        // 读余额走的是网络，必须离开主线程，所以用 executor + 回调串起来。
+        executor.execute {
+            val before = runCatching { savedQuota() }.getOrNull()
+            handler.post {
+                if (closed) return@post
+                quotaBefore = before
+                startAuthorization(target, ghCookies, web)
+            }
+        }
+        schedule()
+    }
+
+    /** 读完基线余额后真正开始授权流程。 */
+    private fun startAuthorization(
+        target: NewApiSiteProfile,
+        ghCookies: String,
+        web: WebView,
+    ) {
+        clearSiteCookies(target) {
+            if (closed) return@clearSiteCookies
             val manager = CookieManager.getInstance()
             if (ghCookies.isNotEmpty()) injectCookies(manager, ghCookies)
             manager.flush()
@@ -178,7 +205,6 @@ class CheckinOauthLoginActivity : ComponentActivity() {
             setStatus("打开站点登录页…")
             web.loadUrl(CheckinOauthPolicy.loginUrl(target))
         }
-        schedule()
     }
 
     private fun fullScreenParams() = FrameLayout.LayoutParams(
@@ -382,12 +408,21 @@ class CheckinOauthLoginActivity : ComponentActivity() {
         runCatching { writer.join(2000) }
     }
 
+    /** 读当前账号余额（quota 原值）；读不到返回 null。 */
+    private fun savedQuota(): Long? {
+        val engine = (application as? AiGatewayApp)?.engine ?: return null
+        val provider = engine.registry.get(providerId)
+            as? NewApiCheckinProvider ?: return null
+        val account = engine.account(providerId, uid) ?: return null
+        return provider.creditInfo(account)?.takeIf { it.known }?.balance
+    }
+
     /** 本账号在导入时保存的 github.com 会话（可能为空 = 需要用户手动登录一次）。 */
     private fun savedGithubCookies(): String {
         val engine = (application as? AiGatewayApp)?.engine ?: return ""
         val account = engine.account(providerId, uid) ?: return ""
         val provider = engine.registry.get(providerId)
-            as? dev.aigw.core.provider.newapi.NewApiCheckinProvider ?: return ""
+            as? NewApiCheckinProvider ?: return ""
         return provider.githubCookiesOf(account)
     }
 
@@ -457,25 +492,26 @@ class CheckinOauthLoginActivity : ComponentActivity() {
         setStatus("核验签到结果…")
         val engine = (application as? AiGatewayApp)?.engine
         verifyFuture = executor.submit {
-            val result = runCatching {
+            val verdict = runCatching {
                 val provider = engine?.registry?.get(providerId)
-                    as? dev.aigw.core.provider.newapi.NewApiCheckinProvider
+                    as? NewApiCheckinProvider
                 val account = engine?.account(providerId, uid)
                 if (provider == null || account == null) {
-                    CheckinLogClient.Result(CheckinLogClient.Outcome.ERROR, "账号不存在，请重新添加")
+                    null
                 } else {
                     // 先把新会话写回账号池，否则核验用的还是旧 cookie。
                     val fresh = account.copy(secret = secretWith(cookies, account.secret))
                     engine.updateAccountSecret(providerId, uid, fresh.secret)
-                    provider.verifyCheckin(fresh, runStartMs)
+                    // 判据与 provider 一致：签到前后余额差。日志接口（CheckinLogClient）
+                    // 在 AgentRouter 上是否可用从未验证过，不能当唯一证据。
+                    val after = provider.creditInfo(fresh)?.takeIf { it.known }?.balance
+                    CheckinQuotaDelta.verdict(quotaBefore, after)
                 }
-            }.getOrElse { e ->
-                CheckinLogClient.Result(CheckinLogClient.Outcome.ERROR, e.message ?: "核验失败")
-            }
+            }.getOrElse { null }
             handler.post {
                 if (closed) return@post
                 verifyFuture = null
-                finishWith(result)
+                finishWith(verdict)
             }
         }
     }
@@ -489,12 +525,10 @@ class CheckinOauthLoginActivity : ComponentActivity() {
         return obj.toString()
     }
 
-    private fun finishWith(result: CheckinLogClient.Result) {
+    private fun finishWith(verdict: CheckinQuotaDelta.Verdict?) {
         step = Step.DONE
-        if (result.outcome == CheckinLogClient.Outcome.FRESH ||
-            result.outcome == CheckinLogClient.Outcome.ALREADY
-        ) {
-            // 额度刚变，立刻重拉一次，用户关掉这个页面就能看到新数字。
+        // 额度刚变，立刻重拉一次，用户关掉这个页面就能看到新数字。
+        if (verdict?.kind == CheckinQuotaDelta.Kind.INCREASED) {
             runCatching {
                 (application as? AiGatewayApp)?.engine?.refreshCredits(providerId, uid)
             }
@@ -503,22 +537,25 @@ class CheckinOauthLoginActivity : ComponentActivity() {
         // 下次签到才能继续免登录。失败也写——会话本身仍是有效的。
         persistGithubCookies()
 
-        when (result.outcome) {
-            CheckinLogClient.Outcome.FRESH -> {
+        when (verdict?.kind) {
+            CheckinQuotaDelta.Kind.INCREASED -> {
                 notice("签到成功，额度已到账")
                 setResult(RESULT_OK)
             }
-            CheckinLogClient.Outcome.ALREADY -> {
-                notice("今天已经签过了，本次没有新增额度")
-                setResult(RESULT_OK)
-            }
-            CheckinLogClient.Outcome.NONE -> {
-                // 登录成功但日志里没有记录 = 额度没有真的发放，必须如实报失败。
-                notice("登录完成，但站点日志里没有今天的签到记录，额度可能没到账")
+            // 登录成功了但额度没动：可能今天早些时候已经签过。不能报成功。
+            CheckinQuotaDelta.Kind.UNCHANGED -> {
+                notice("登录完成，但额度没有变化 —— 今天可能已经签过")
                 setResult(RESULT_CANCELED)
             }
-            CheckinLogClient.Outcome.ERROR -> {
-                notice("签到结果核验失败：${result.detail}")
+            CheckinQuotaDelta.Kind.AFTER_ONLY,
+            CheckinQuotaDelta.Kind.UNKNOWN,
+            -> {
+                // 没有签到前基线，无法证明加没加钱：如实说「已重新登录」。
+                notice("已重新登录站点，请在列表里刷新余额确认")
+                setResult(RESULT_OK)
+            }
+            null -> {
+                notice("核验失败：账号不存在，请重新添加")
                 setResult(RESULT_CANCELED)
             }
         }
@@ -548,7 +585,6 @@ class CheckinOauthLoginActivity : ComponentActivity() {
     private fun stopLogin() {
         if (closed) return
         closed = true
-        commitGate.cancel()
         verifyFuture?.cancel(true)
         executor.shutdownNow()
         handler.removeCallbacksAndMessages(null)

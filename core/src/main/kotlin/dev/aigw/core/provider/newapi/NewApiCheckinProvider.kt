@@ -45,6 +45,13 @@ import dev.aigw.core.util.stringOrNull
 class NewApiCheckinProvider(
     private val profile: NewApiSiteProfile,
     private val hooks: ProviderHooks = ProviderHooks(),
+    /**
+     * OAuth 签到的执行器，默认连真实 GitHub。
+     *
+     * 抽成可注入只为单测：`oauthCheckin` 里「签到前后余额差 → 成功/失败」这条接线
+     * 必须能在本地跑，否则「额度没变却报成功」这类回归只能等真机发现。
+     */
+    private val oauthRunner: CheckinOauthRunner = CheckinOauthRunner.Real(profile),
 ) : Provider {
 
     override val id: String = profile.providerId
@@ -161,6 +168,16 @@ class NewApiCheckinProvider(
      *
      * 成功时把站点下发的新会话（可能轮换）与当日签到结果一起回写账号池，
      * 这样下一次批量签到不必再要用户点任何东西。
+     *
+     * ## 判据：签到前后余额差，不是 `checked_in`
+     *
+     * `data.checked_in` 对**当天已经签过**的账号同样为 true（站点前端据此提示
+     * 「签到成功，新增额度已到账」，但它自己也不知道这次有没有加钱）。
+     * 拿它当本次成功的证据，就会重演「每天点一次都报成功、额度一分没涨」。
+     *
+     * 唯一用户真正关心的证据是**额度数字动了没有**：
+     * 签到前记一次 `quota`，OAuth 后再记一次，`after > before` 才算本次新增。
+     * 这与 checkin-agentrouter（jiang7f）的 `calculate_check_in_reward` 同一口径。
      */
     private fun oauthCheckin(account: ProviderAccount): ProviderActionResult {
         val credential = parse(account) ?: return ProviderActionResult.failure("凭证无法解析")
@@ -170,21 +187,34 @@ class NewApiCheckinProvider(
                 "「${profile.name}」还没有保存 GitHub 登录态：需要先授权一次，之后每天可自动完成",
             )
         }
-        val client = CheckinOauthClient(profile)
-        return when (val outcome = client.checkin(credential.cookies, githubCookies)) {
+        val quotaBefore = runCatching { quotaValue(fetchSelf(credential, account.uid), "quota", true) }.getOrNull()
+        return when (val outcome = oauthRunner.run(credential.cookies, githubCookies)) {
             is CheckinOauthClient.Outcome.Completed -> {
                 if (outcome.cookies.isNotEmpty()) {
                     persistSiteCookies(account, credential, outcome.cookies)
                 }
-                val quota = runCatching {
-                    val data = fetchSelf(parse(account)?.copy(cookies = mergedCookies(credential, outcome.cookies)) ?: credential, account.uid)
-                    quotaValue(data, "quota", required = true)
+                val freshCredential = parse(account)?.copy(cookies = mergedCookies(credential, outcome.cookies))
+                    ?: credential
+                val quotaAfter = runCatching {
+                    quotaValue(fetchSelf(freshCredential, account.uid), "quota", true)
                 }.getOrNull()
-                val tail = quota?.let { "，当前余额 ${dollars(it)}" }.orEmpty()
-                if (outcome.checkedIn) {
-                    ProviderActionResult.success("已通过 GitHub 登录完成签到$tail")
-                } else {
-                    ProviderActionResult.success("今日额度已发放（登录时由站点自动完成）$tail")
+                val verdict = CheckinQuotaDelta.verdict(quotaBefore, quotaAfter)
+                when (verdict.kind) {
+                    // 余额真的涨了：这是唯一能报「签到成功」的情形。
+                    CheckinQuotaDelta.Kind.INCREASED -> ProviderActionResult.success(
+                        "签到成功，本次新增 ${dollars(verdict.delta)}，当前余额 ${dollars(verdict.after ?: 0)}",
+                    )
+                    // 额度没动：可能今天早些时候已经签过，也可能站点没发。
+                    // 不能报成功——那正是上一版的病。
+                    CheckinQuotaDelta.Kind.UNCHANGED -> ProviderActionResult.failure(
+                        "登录完成，但额度没有变化（${dollars(verdict.after ?: 0)}）——今天可能已经签过；" +
+                            "若确定没签过，请检查站点是否仍在发放签到额度",
+                    )
+                    CheckinQuotaDelta.Kind.AFTER_ONLY -> ProviderActionResult.success(
+                        "已重新登录「${profile.name}」，当前余额 ${dollars(verdict.after ?: 0)}",
+                    )
+                    CheckinQuotaDelta.Kind.UNKNOWN ->
+                        ProviderActionResult.success("已重新登录「${profile.name}」，余额查询失败，请稍后刷新确认")
                 }
             }
             CheckinOauthClient.Outcome.NeedsRelogin -> ProviderActionResult.requiresUi(

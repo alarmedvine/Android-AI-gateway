@@ -83,6 +83,12 @@ class NewApiCheckinProviderTest {
         {"success":true,"data":{"id":42,"username":"u","display_name":"测试账号","quota":$quota,"used_quota":$used}}
     """.trimIndent()
 
+    /** 只回放固定结局的签到执行器，用来钉住 provider 的判据接线。 */
+    private class StubOauth(private val outcome: CheckinOauthClient.Outcome) : CheckinOauthRunner {
+        override fun run(siteCookies: Map<String, String>, githubCookies: String): CheckinOauthClient.Outcome =
+            outcome
+    }
+
     // ------------------------------------------------------------------ 余额
 
     @Test
@@ -179,6 +185,81 @@ class NewApiCheckinProviderTest {
             result.message.contains("请点一次「重新授权签到」"),
             "有 GitHub 会话时不该再要求手动操作：${result.message}",
         )
+    }
+
+    @Test
+    fun `OAuth 站点签到时余额涨了才报成功`() {
+        // 签到前 25 美元，签到后 37.5 美元 → 必须报成功并带新增额
+        var selfCalls = 0
+        server.createContext("/api/user/self") { exchange: HttpExchange ->
+            selfCalls++
+            val quota = if (selfCalls == 1) 25_000_000L else 37_500_000L
+            val bytes = selfOk(quota = quota).toByteArray(StandardCharsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(
+                CheckinOauthClient.Outcome.Completed(
+                    cookies = emptyMap(),
+                    checkedIn = true,
+                    body = """{"success":true,"data":{"id":42,"checked_in":true}}""",
+                ),
+            ),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertTrue(result.ok, result.message)
+        assertTrue(result.message.contains("25.00"), "应报出新增 25.00 美元：${result.message}")
+    }
+
+    @Test
+    fun `OAuth 站点签到时余额没变必须报失败`() {
+        // 这是最关键的一条负控：checked_in=true 但额度一分没动。
+        // 上一版就是在这里报成功，用户看到「签到成功」而余额不变。
+        respond("/api/user/self", 200, selfOk(quota = 25_000_000))
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(
+                CheckinOauthClient.Outcome.Completed(
+                    cookies = emptyMap(),
+                    checkedIn = true,
+                    body = """{"success":true,"data":{"id":42,"checked_in":true}}""",
+                ),
+            ),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, "额度没变绝不能报成功：${result.message}")
+        assertTrue(result.message.contains("没有变化"), result.message)
+    }
+
+    @Test
+    fun `OAuth 兑换被站点拒绝时报失败而不是成功`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(CheckinOauthClient.Outcome.Failed("GitHub 授权失败，请重新登录 GitHub 授权")),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, result.message)
+        assertTrue(result.message.contains("GitHub 授权失败"), result.message)
+    }
+
+    @Test
+    fun `OAuth 需要重新登录时标记为界面接手`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(CheckinOauthClient.Outcome.NeedsRelogin),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, result.message)
+        assertTrue(result.requiresUi, "必须标记界面接手：${result.message}")
     }
 
     @Test

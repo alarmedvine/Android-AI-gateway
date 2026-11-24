@@ -19,7 +19,23 @@ import dev.aigw.core.util.HttpSupport
  * 3. `GET {domain}/api/oauth/github?code=..&state=..&mode=login`
  *    → 站点兑换 code、发放当日额度、下发新 session cookie
  *
- * 判据仍以站点日志为准（见 [CheckinLogClient]）：`checked_in` 只说"今天签过"，
+ * ## ★ 第 3 步必须是 `/api/oauth/github`，不是 `/oauth/github`
+ *
+ * 站点把 `/oauth/github` 注册成 **SPA 前端路由**（GitHub 的 redirect_uri 指向它），
+ * 浏览器打开它只会拿到 1586 字节的 HTML 空壳，由页面里的 JS 去调真正的兑换接口。
+ * 实测（2026-11-25，agentrouter.org）：
+ *
+ * ```
+ * GET /oauth/github?code=..&state=..            → 200 text/html  1586B（空壳，不兑换）
+ * GET /api/oauth/github?code=..&state=..&mode=login → 200 application/json（真兑换）
+ * ```
+ *
+ * 站点前端原文：``await Ee.get(`/api/oauth/${t.type}?code=${l}&state=${u}&mode=${c}`)``。
+ * 上一版把 302 的 Location 原样 GET，拿到 HTML，解析不出 session 却回执 Completed，
+ * 于是「CI 绿、真机一分额度没加」——本类的测试当时也伪造了 `GET /oauth/github` 返回 JSON，
+ * 与真实行为不符，等于给错误的实现盖了章。
+ *
+ * 判据仍以站点日志 / 余额差为准（见 [CheckinLogClient]）：`checked_in` 只说"今天签过"，
  * 不说"是不是这一次签的"。
  */
 class CheckinOauthClient(
@@ -69,30 +85,37 @@ class CheckinOauthClient(
         val state = fetchState(base) ?: return Outcome.Failed("站点没有下发 OAuth state")
         val authorizeUrl = buildAuthorizeUrl(state) ?: return Outcome.Failed("站点未提供 GitHub client_id")
 
-        // 带 GitHub 会话访问授权页。GitHub 对已授权的应用直接 302 回回调。
+        // 带 GitHub 会话访问授权页。GitHub 对已授权的应用直接 302 回站点的 SPA 路由。
         val authorize = httpGet(authorizeUrl, githubHeaders(githubCookies))
-        val callbackUrl = resolveCallbackUrl(authorize, base)
+        val callbackParams = resolveCallbackParams(authorize, base)
             ?: return when (authorize.status) {
                 200 -> if (looksLikeGithubLogin(authorize.body)) Outcome.NeedsRelogin else Outcome.NeedsAuthorize
-                302, 301, 303 -> if (looksLikeGithubLogin(authorize.location.orEmpty())) {
-                    Outcome.NeedsRelogin
-                } else {
-                    Outcome.NeedsAuthorize
+                301, 302, 303, 307, 308 -> {
+                    val target = authorize.location.orEmpty()
+                    if (looksLikeGithubLogin(target)) Outcome.NeedsRelogin else Outcome.NeedsAuthorize
                 }
                 else -> Outcome.Failed("GitHub 授权返回 HTTP ${authorize.status}")
             }
 
-        // 站点回调：兑换 code 并发放额度。
-        val callback = httpGet(callbackUrl, siteHeaders(siteCookies))
-        val setCookies = parseSetCookies(callback.setCookies)
-        return when {
-            callback.status !in 200..299 -> Outcome.Failed("站点回调返回 HTTP ${callback.status}")
-            else -> Outcome.Completed(
-                cookies = setCookies,
-                checkedIn = CheckinOauthPolicy.claimedCheckin(callback.body),
-                body = callback.body,
-            )
+        // ★ 真正的兑换接口是 `/api/oauth/github`，不是 SPA 路由 `/oauth/github`（见类注释）。
+        // 这里刻意用 GitHub 回跳里带的 code+state 自己拼 API URL，而不是去 GET 那个 HTML 空壳。
+        val exchangeUrl = "$base/api/oauth/github?code=${enc(callbackParams.first)}" +
+            "&state=${enc(callbackParams.second)}&mode=login"
+        val callback = httpGet(exchangeUrl, siteHeaders(siteCookies))
+        if (callback.status !in 200..299) {
+            return Outcome.Failed("站点兑换接口返回 HTTP ${callback.status}")
         }
+        // 兑换失败时站点返回 200 + success:false（实测：code 过期时
+        // `{"message":"GitHub 授权失败…","success":false}`）。不能当成功。
+        if (!CheckinOauthPolicy.responseSuccess(callback.body)) {
+            val reason = CheckinOauthPolicy.responseMessage(callback.body)
+            return Outcome.Failed(reason.ifEmpty { "站点拒绝兑换授权码" })
+        }
+        return Outcome.Completed(
+            cookies = parseSetCookies(callback.setCookies),
+            checkedIn = CheckinOauthPolicy.claimedCheckin(callback.body),
+            body = callback.body,
+        )
     }
 
     private fun fetchState(base: String): String? {
@@ -112,26 +135,52 @@ class CheckinOauthClient(
     }
 
     /**
-     * 从授权响应里取出站点回调 URL。
+     * 从授权响应里取出 `(code, state)`。
      *
-     * GitHub 可能：①直接 302 到 `{domain}/oauth/github?code=..`；
-     * ②先 302 到中间页再跳；③返回登录页/确认页（HTML）。
+     * GitHub 的 302 Location 形如 `{domain}/oauth/github?code=..&state=..`——
+     * 那是**站点注册给 GitHub 的回跳地址**，是 SPA 路由。我们只从它身上取两个参数，
+     * 不去 GET 它（GET 只会拿到 HTML 空壳，见类注释）。
+     *
+     * 可能的情况：①直接 302 带 code；②先 302 到 github.com 的中间页再跳；
+     * ③返回登录页/确认页（HTML，说明会话失效或需要再授权）。
      */
-    private fun resolveCallbackUrl(res: HttpResult, base: String): String? {
-        res.location?.let { loc ->
-            val absolute = if (loc.startsWith("http")) loc else base + loc
-            if (CheckinOauthPolicy.isCallbackUrl(absolute, profile)) return absolute
-            // 中间跳转：继续跟一跳（GitHub 有时先到 /login/oauth/authorize?...）
-            if (absolute.contains("github.com")) {
-                val second = httpGet(absolute, githubHeaders(""))
-                second.location?.let { loc2 ->
-                    val abs2 = if (loc2.startsWith("http")) loc2 else base + loc2
-                    if (CheckinOauthPolicy.isCallbackUrl(abs2, profile)) return abs2
-                }
-            }
+    private fun resolveCallbackParams(res: HttpResult, base: String): Pair<String, String>? {
+        val loc = res.location ?: return null
+        extractCodeState(loc, base)?.let { return it }
+        // GitHub 掉到登录页 = 会话失效，**不要再跟一跳**：
+        // 跟着去 GET 登录页既拿不到 code，还会把「需要重新登录」误判成「需要确认授权」。
+        if (looksLikeGithubLogin(loc)) return null
+        // 中间跳转：GitHub 有时先到 /login/oauth/authorize?...，再跳到站点。
+        if (loc.contains("github.com")) {
+            val absolute = if (loc.startsWith("http")) loc else "https://github.com$loc"
+            val second = httpGet(absolute, githubHeaders(""))
+            extractCodeState(second.location, base)?.let { return it }
         }
         return null
     }
+
+    /** 从 `{domain}/oauth/github?code=..&state=..` 里取两个参数；不是该路径就返回 null。 */
+    private fun extractCodeState(location: String?, base: String): Pair<String, String>? {
+        val raw = location ?: return null
+        val absolute = if (raw.startsWith("http")) raw else base + raw
+        if (!CheckinOauthPolicy.isCallbackUrl(absolute, profile)) return null
+        val query = absolute.substringAfter('?', "")
+        if (query.isEmpty()) return null
+        val params = query.split('&').mapNotNull { part ->
+            val i = part.indexOf('=')
+            if (i <= 0) null else decode(part.substring(0, i)) to decode(part.substring(i + 1))
+        }.toMap()
+        val code = params["code"]?.takeIf { it.isNotEmpty() } ?: return null
+        val state = params["state"]?.takeIf { it.isNotEmpty() } ?: return null
+        return code to state
+    }
+
+    /**
+     * 先解码再编码：Location 里的值已经是 percent-encoded 的，
+     * 直接丢给 [enc] 会二次编码（`%2B` → `%252B`），服务端解出来就是错的。
+     */
+    private fun decode(s: String): String =
+        runCatching { java.net.URLDecoder.decode(s, "UTF-8") }.getOrDefault(s)
 
     private fun looksLikeGithubLogin(text: String): Boolean =
         text.contains("/login?") || text.contains("Sign in to GitHub") || text.contains("sign in")
