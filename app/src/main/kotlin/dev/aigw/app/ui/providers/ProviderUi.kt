@@ -44,6 +44,22 @@ class ProviderUiActions(
     val onRefreshCredits: (providerId: String, uid: String?) -> Unit = { _, _ -> },
     /** 执行供应商专属动作（签到、兑换码等）。 */
     val onAction: (providerId: String, uid: String, action: String, payload: JsonObject) -> Unit = { _, _, _, _ -> },
+
+    /**
+     * 执行动作；若该动作必须走界面（如站点没有签到接口、必须重新走一次 OAuth），
+     * 由实现方调用 [requireUi] 交给界面处理。
+     *
+     * 之所以保留两个入口：纯后台的批量签到只认 [onAction]（它自己会走纯 HTTP），
+     * 而界面上的按钮需要「先静默试一次，失败再弹页面」这条更省事的路。
+     */
+    val onActionWithUiFallback:
+        (
+            providerId: String,
+            uid: String,
+            action: String,
+            payload: JsonObject,
+            requireUi: () -> Unit,
+        ) -> Unit = { _, _, _, _, _ -> },
     /** 调整账号使用优先级（↑/↓）：排在前面的先用，同级仍按余额。 */
     val onMoveAccountPriority: (providerId: String, uid: String, up: Boolean) -> Unit = { _, _, _ -> },
     val onToggleAccount: (providerId: String, uid: String, enabled: Boolean) -> Unit = { _, _, _ -> },

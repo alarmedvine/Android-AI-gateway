@@ -64,12 +64,22 @@ data class ProviderActionResult(
     val ok: Boolean,
     val message: String,
     val unsupported: Boolean = false,
+    /**
+     * 这条失败必须由界面接手才有意义（例如站点的签到要靠重新走一次 OAuth）。
+     *
+     * 后台批量签到不会弹界面，它只把这句话原样记进日志；界面按钮看到它就
+     * 打开对应的授权页。**不要让调用方靠文案猜**——文案会改，这个位不会。
+     */
+    val requiresUi: Boolean = false,
 ) {
     companion object {
         fun success(message: String = "") = ProviderActionResult(true, message)
         fun failure(message: String) = ProviderActionResult(false, message)
         fun unsupported(action: String) =
             ProviderActionResult(false, "该供应商不支持「$action」", unsupported = true)
+
+        /** 只有界面能处理的动作（如必须重新走 OAuth 的签到）。 */
+        fun requiresUi(message: String) = ProviderActionResult(false, message, requiresUi = true)
     }
 }
 

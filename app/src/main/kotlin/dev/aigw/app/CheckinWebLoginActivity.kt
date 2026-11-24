@@ -240,6 +240,12 @@ class CheckinWebLoginActivity : ComponentActivity() {
             val raw = JsonObject().apply {
                 addProperty("cookies", CheckinCookie.format(cookies))
                 addProperty("apiUserId", uid)
+                // 把这次登录建立的 github.com 会话一起带走。
+                // 没有它，下次「重新授权签到」会掉到 GitHub 登录页，
+                // 用户又要输一次密码 + 再批准一次——摩擦比浏览器还大。
+                // 每个账号各存各的：两个账号对应两个 GitHub 身份，共用会签错号。
+                val gh = readGithubCookies()
+                if (gh.isNotEmpty()) addProperty("githubCookies", gh)
             }.toString()
             attempts++
             importFuture = executor.submit {
@@ -275,6 +281,17 @@ class CheckinWebLoginActivity : ComponentActivity() {
             }
         }
     }
+
+    /**
+     * 读当前 WebView 里 github.com 的会话串（`k=v; k=v`）。
+     *
+     * 只能读 CookieManager：GitHub 的 `user_session` 是 HttpOnly，
+     * `document.cookie` 看不到，但 native 的 `getCookie` 能读出来。
+     */
+    private fun readGithubCookies(): String =
+        runCatching { CookieManager.getInstance().getCookie("https://github.com").orEmpty() }
+            .getOrDefault("")
+            .trim()
 
     private fun notice(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
 

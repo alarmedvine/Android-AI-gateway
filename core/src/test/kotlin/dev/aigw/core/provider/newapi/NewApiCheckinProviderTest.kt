@@ -14,6 +14,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -45,11 +46,15 @@ class NewApiCheckinProviderTest {
         server.stop(0)
     }
 
-    private fun profile(signInPath: String = "") = NewApiSiteProfile(
+    private fun profile(
+        signInPath: String = "",
+        mode: CheckinMode = CheckinMode.API,
+    ) = NewApiSiteProfile(
         key = "test",
         name = "Test Site",
         domain = "http://127.0.0.1:$port",
         signInPath = signInPath,
+        checkinMode = mode,
     )
 
     private fun respond(path: String, status: Int, body: String, capture: Boolean = true) {
@@ -74,9 +79,20 @@ class NewApiCheckinProviderTest {
             secret = secret,
         )
 
-    private fun selfOk(quota: Long = 25_000_000, used: Long = 500_000) = """
-        {"success":true,"data":{"id":42,"username":"u","display_name":"测试账号","quota":$quota,"used_quota":$used}}
+    private fun selfOk(
+        quota: Long = 25_000_000,
+        used: Long = 500_000,
+        checkedIn: Boolean = false,
+    ) = """
+        {"success":true,"data":{"id":42,"username":"u","display_name":"测试账号",
+        "quota":$quota,"used_quota":$used,"checked_in":$checkedIn}}
     """.trimIndent()
+
+    /** 只回放固定结局的签到执行器，用来钉住 provider 的判据接线。 */
+    private class StubOauth(private val outcome: CheckinOauthClient.Outcome) : CheckinOauthRunner {
+        override fun run(siteCookies: Map<String, String>, githubCookies: String): CheckinOauthClient.Outcome =
+            outcome
+    }
 
     // ------------------------------------------------------------------ 余额
 
@@ -146,13 +162,171 @@ class NewApiCheckinProviderTest {
     // ------------------------------------------------------------------ 签到
 
     @Test
-    fun `无签到接口的站点靠查询用户信息完成签到`() {
+    fun `无签到接口的站点不能靠查询用户信息冒充签到`() {
+        // 这条曾经断言「查一次 /api/user/self 就算签到成功」，那是错的：
+        // AgentRouter 的额度只在一次新的 OAuth 登录里发放，查余额永远不加额度。
+        // 现在没有保存 GitHub 会话时，必须明确失败并指出要先授权一次。
         respond("/api/user/self", 200, selfOk(quota = 30_000_000))
-        val provider = NewApiCheckinProvider(profile(signInPath = ""))
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
         val result = provider.performAction(account(), ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, result.message)
+        // 文案会改，所以断言的是 requiresUi 这个位而不是措辞
+        assertTrue(result.requiresUi, "必须标记为需要界面接手：${result.message}")
+        // 关键：不能再悄悄打 /api/user/self 然后报成功
+        assertTrue(lastMethod.isNullOrEmpty(), "不该发出任何请求，实际 $lastMethod")
+    }
+
+    @Test
+    fun `有 GitHub 会话时批量签到会真的执行而不是只提示`() {
+        // 批量签到（AutoCheckin）没有 UI，必须能纯 HTTP 完成。
+        // 这里验证它至少不会在"有 GitHub 会话"时直接返回"请手动点"。
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        // 本地没有真 GitHub，流程会失败，但**不能**是"请手动点"那条文案
+        assertFalse(result.ok, result.message)
+        assertFalse(
+            result.message.contains("请点一次「重新授权签到」"),
+            "有 GitHub 会话时不该再要求手动操作：${result.message}",
+        )
+    }
+
+    @Test
+    fun `OAuth 站点签到时余额涨了才报成功`() {
+        // 签到前 25 美元，签到后 37.5 美元 → 必须报成功并带新增额
+        var selfCalls = 0
+        server.createContext("/api/user/self") { exchange: HttpExchange ->
+            selfCalls++
+            val quota = if (selfCalls == 1) 25_000_000L else 37_500_000L
+            val bytes = selfOk(quota = quota).toByteArray(StandardCharsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(
+                CheckinOauthClient.Outcome.Completed(
+                    cookies = emptyMap(),
+                    checkedIn = true,
+                    body = """{"success":true,"data":{"id":42,"checked_in":true}}""",
+                ),
+            ),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
         assertTrue(result.ok, result.message)
-        assertTrue(result.message.contains("$60.00"), result.message)
-        assertEquals("GET", lastMethod)
+        assertTrue(result.message.contains("25.00"), "应报出新增 25.00 美元：${result.message}")
+    }
+
+    @Test
+    fun `余额没变但站点说今天已签过时算达成不算失败`() {
+        // 当天已签过：额度本来就不会再涨。若报失败，自动签到会每小时重走一遍 OAuth，
+        // 一整天刷满失败记录，还可能触发上游风控。
+        // selfOk 默认不带 checked_in，这里显式给 true。
+        respond("/api/user/self", 200, selfOk(quota = 25_000_000, checkedIn = true))
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(
+                CheckinOauthClient.Outcome.Completed(
+                    cookies = emptyMap(),
+                    checkedIn = true,
+                    body = """{"success":true,"data":{"id":42,"checked_in":true}}""",
+                ),
+            ),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertTrue(result.ok, "今天已签过不是失败：${result.message}")
+        assertTrue(result.message.contains("已经签过"), result.message)
+    }
+
+    @Test
+    fun `余额没变且站点没说签过时必须报失败`() {
+        // 上一版就是在这里报成功，用户看到「签到成功」而余额不变。
+        // selfOk 默认 checked_in=false，模拟「登录了但额度真没发」。
+        respond("/api/user/self", 200, selfOk(quota = 25_000_000, checkedIn = false))
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(
+                CheckinOauthClient.Outcome.Completed(
+                    cookies = emptyMap(),
+                    checkedIn = false,
+                    body = """{"success":true,"data":{"id":42,"checked_in":false}}""",
+                ),
+            ),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, "额度没变且站点没说签过，绝不能报成功：${result.message}")
+        assertTrue(result.message.contains("没有变化"), result.message)
+    }
+
+    @Test
+    fun `OAuth 兑换被站点拒绝时报失败而不是成功`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(CheckinOauthClient.Outcome.Failed("GitHub 授权失败，请重新登录 GitHub 授权")),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, result.message)
+        assertTrue(result.message.contains("GitHub 授权失败"), result.message)
+    }
+
+    @Test
+    fun `OAuth 需要重新登录时标记为界面接手`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(
+            profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN),
+            oauthRunner = StubOauth(CheckinOauthClient.Outcome.NeedsRelogin),
+        )
+        val withGh = account(secret = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh"}""")
+        val result = provider.performAction(withGh, ACTION_CHECKIN, com.google.gson.JsonObject())
+        assertFalse(result.ok, result.message)
+        assertTrue(result.requiresUi, "必须标记界面接手：${result.message}")
+    }
+
+    @Test
+    fun `导入时保存 github 会话，供签到免登录`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val raw = """{"cookies":"session=abc","apiUserId":"42","githubCookies":"user_session=gh; logged_in=yes"}"""
+        val imported = assertNotNull(provider.importCredentials(raw))
+        // 存进去
+        assertEquals("user_session=gh; logged_in=yes", provider.githubCookiesOf(imported))
+    }
+
+    @Test
+    fun `没带 github 会话的导入不会凭空造一个`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val imported = assertNotNull(provider.importCredentials("""{"cookies":"session=abc","apiUserId":"42"}"""))
+        assertEquals("", provider.githubCookiesOf(imported))
+    }
+
+    @Test
+    fun `两个账号的 github 会话互不串`() {
+        respond("/api/user/self", 200, selfOk())
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        val a = assertNotNull(provider.importCredentials(
+            """{"cookies":"session=a","apiUserId":"42","githubCookies":"user_session=ghA"}""",
+        ))
+        val b = assertNotNull(provider.importCredentials(
+            """{"cookies":"session=b","apiUserId":"42","githubCookies":"user_session=ghB"}""",
+        ))
+        // 这条是防「签成别人账号」的关键：两个账号必须各存各的
+        assertEquals("user_session=ghA", provider.githubCookiesOf(a))
+        assertEquals("user_session=ghB", provider.githubCookiesOf(b))
+    }
+
+    @Test
+    fun `OAuth 站点的签到方式对外可见`() {
+        val provider = NewApiCheckinProvider(profile(signInPath = "", mode = CheckinMode.OAUTH_RELOGIN))
+        assertEquals(CheckinMode.OAUTH_RELOGIN, provider.checkinMode())
+        assertEquals("http://127.0.0.1:$port", provider.siteProfile().domain)
     }
 
     @Test
